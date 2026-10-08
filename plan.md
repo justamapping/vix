@@ -12,19 +12,19 @@ State is two axes: **view × mode**.
 | | normal | insert | visual | command |
 |---|---|---|---|---|
 | **list** (outer) | motions/operators over terminal names | edit names as text | select terminals | `:w`, `:q`, ... |
-| **zoom** (inner) | motions over the terminal's text | keys go to the program | select text | `:w`, `:q`, ... |
+| **view** (inner) | motions over the terminal's text | keys go to the program | select text | `:x`, `:q`, ... |
 
-`i` always means "insert into what you're looking at": the name in list, the program in zoom.
+`i` always means "insert into what you're looking at": the name in list, the program in view.
 
 ### transitions
 
 ```
-list n   --<CR>-->   zoom i      open terminal under cursor, start typing
-zoom i   --<C-\>-->  zoom n      the only key vix steals; <C-\><C-\> sends a literal
-zoom n   --i/a-->    zoom i
-zoom n   -- - -->    list n      (oil's "go up")
-zoom n   --J/K-->    zoom n      next/prev terminal, counts work (3J)
-zoom n   --<C-^>-->  zoom n      alternate terminal
+list n   --<CR>-->   view i      open terminal under cursor, start typing, i.e. go into view<i>
+view i   --<C-\>-->  view n      the only key vix steals; <C-\><C-\> sends a literal. our <Esc> key of vim
+view n   --i/a-->    view i
+view n   -- - -->    list n      (oil's "go up")
+view n   --J/K-->    view n      next/prev terminal, counts work (3J)
+view n   --<C-^>-->  view n      alternate terminal
 ```
 
 ## list view
@@ -36,6 +36,7 @@ foo
 bar
 buzz
 ```
+rmk: we can also open it under a configuration of these names/terminals, i.e. vix webworkflow
 
 `jj<CR>` opens `buzz`. Edits are staged; `:w` applies, `u` / `:e!` discards.
 
@@ -63,7 +64,7 @@ So `yyp`, `Vjy` + `p`, `dd`, `ddp`, `cw`, `o` all fall out of plain text editing
 Behave like vim's `hidden`: `<CR>` into a terminal with a modified buffer is allowed, status shows `[+]`.
 `<CR>` on a line with no id (not yet written) errors: "not written".
 
-## zoom view
+## view mode
 
 Insert: full passthrough to the program except `<C-\>`.
 
@@ -79,16 +80,18 @@ Normal: the terminal's scrollback + screen becomes a text buffer. Scrolling and 
 The whole terminal output should be editable, not just navigable. Editing can't affect the process, so editing
 means working on a snapshot: delete noise, reshape, yank, `:w file`.
 
-- **A: blended into zoom n.** Operators (`d c x`) work directly; the first edit freezes the buffer off live output.
+- **A: blended into view n.** Operators (`d c x`) work directly; the first edit freezes the buffer off live output.
   Problem: `i` already means "type into the program", so insert-mode edits need another way in.
 - **B: separate text state.** A key (TBD) snapshots the output into its own editable buffer with full vim keys.
   Cleaner modes, one more state.
 
-Leaning B for clarity; decide after zoom n exists.
+Leaning B for clarity; decide after view n exists.
+
+rmk: it also means we get full access to the editing terminal output, somewhat unprecedented
 
 ## vim scope
 
-All valid text **motions** should exist in every buffer (list, zoom n, editable output). Operators, registers,
+All valid text **motions** should exist in every buffer (list, view n, editable output). Operators, registers,
 and ex commands can grow from a small set. The text engine sits behind one interface so we can swap it later:
 
 ```rust
@@ -113,21 +116,29 @@ Rust. Pure modules first, I/O at the edges.
 | `listdiff` | pure | `:w` rules |
 | `buffer` | pure | `TextBuffer` impl |
 | `pty` | io | spawn/resize/read/write (`portable-pty`) |
-| `emulator` | io-ish | per-pty screen + scrollback (`alacritty_terminal` or `vt100`) |
-| `render` | io | draw list / zoom / status line (`crossterm`, maybe `ratatui`) |
+| `vt` | io-ish | per-pty screen + scrollback state, parsed from the pty's escape sequences (`vt100` crate) |
+| `render` | io | draw list / view / status line (`crossterm`, maybe `ratatui`) |
 | `input` | io | parse stdin incl. kitty keyboard `CSI u` encodings of `<C-\>` |
 | `config` | io | `~/.config/vix/config.toml` keybinds |
 | `server` | io | later: daemon owns ptys, clients over unix socket |
 
 Status line is one row: `3/7 buzz  NORMAL [+]`. ptys are sized to `rows - 1`.
 
+### multiplexer, not emulator
+
+vix runs inside the user's terminal (ghostty, kitty, ...), like tmux. It still needs a vt parser per pty
+(tmux has its own in grid.c/screen.c): switching back to a terminal, view n text, `/` search, and list previews all
+need to know what's on screen, which only exists as a stream of escape sequences. We use a crate for this, we don't
+write one. Raw passthrough + SIGWINCH redraw (the dtach trick) works without it, but only for TUIs that redraw
+themselves; a plain shell comes back blank.
+
 ## milestones
 
 1. **spike**: one pty, raw passthrough, `<C-\>` drops to a placeholder screen and back. Proves input handling,
-   the riskiest part.
+   the riskiest part. No vt yet; returning uses the SIGWINCH redraw trick.
 2. **state machine + list**: `state`, `keymap`, `listdiff` with tests. Multiple terminals, `j k gg G <CR> o dd yy p
    cw i <Esc> :w u`, redraw from emulator on switch.
-3. **zoom n**: scrollback as text buffer, motions, `J/K`, `<C-^>`, `/`, yank to clipboard (OSC 52).
+3. **view n**: scrollback as text buffer, motions, `J/K`, `<C-^>`, `/`, yank to clipboard (OSC 52).
 4. **status**: per-terminal running command, cwd (OSC 7), bell, exited; maybe as virtual text in list.
 5. **config**: keybinds from toml.
 6. **server/client**: persistence, detach/attach, `$VIX` nesting depth, shell integration (`:x`/`:q` functions
@@ -138,7 +149,14 @@ Status line is one row: `3/7 buzz  NORMAL [+]`. ptys are sized to `rows - 1`.
 
 - editable output: blended or separate state, and the key to enter it
 - clone semantics beyond "same cwd + env" (re-run foreground command?)
-- `alacritty_terminal` vs `vt100`
-- homemade vim vs `nvim --embed` once the list and zoom n exist
+- vt parser: start with `vt100`, move to `alacritty_terminal` if fidelity breaks (claude code, nvim)
+- homemade vim vs `nvim --embed` once the list and view n exist
 - `:x` vs `:q` from inside a shell: `:q` = back to list (vim never destroys on `:q`), `:q!` = kill?
 - `/` from list: search names only, or scrollback too (jump to terminal + match line)?
+
+## answers
+- blended state for now
+- start with cwd, later try current process
+- it's not a terminal emulator, it's comparable to tmux, it's a multiplexer
+- start with homemade for now
+- q! could delete it, x or q could save it buffer wise (keeps its name and process)
