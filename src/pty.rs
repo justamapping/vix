@@ -39,6 +39,10 @@ impl Pty {
         self.master.resize(size(cols, rows))
     }
 
+    pub fn pid(&self) -> Option<u32> {
+        self.child.process_id()
+    }
+
     pub fn kill(&mut self) {
         let _ = self.child.kill();
     }

@@ -1,4 +1,4 @@
-use crate::input::{CTRL_BACKSLASH, Input};
+use crate::input::Input;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum View {
@@ -7,13 +7,13 @@ pub enum View {
     Normal(u64),
 }
 
-/// `<C-\>` transitions. Returns the next view and bytes for the terminal.
+/// Escape key transitions (`<C-\>` by default). Returns the next view and bytes for the terminal.
 /// The list and view n keys are driven by buffers, not here.
-pub fn step(view: View, input: Input) -> (View, Vec<u8>) {
+pub fn step(view: View, input: Input, esc: u8) -> (View, Vec<u8>) {
     match (view, input) {
         (View::Insert(t), Input::Bytes(b)) => (View::Insert(t), b),
         (View::Insert(t), Input::Escape) => (View::Normal(t), vec![]),
-        (View::Normal(t), Input::Escape) => (View::Insert(t), vec![CTRL_BACKSLASH]),
+        (View::Normal(t), Input::Escape) => (View::Insert(t), vec![esc]),
         (view, _) => (view, vec![]),
     }
 }
@@ -28,16 +28,16 @@ mod tests {
 
     #[test]
     fn insert_passes_through() {
-        assert_eq!(step(View::Insert(1), bytes(b"ls")), (View::Insert(1), b"ls".to_vec()));
+        assert_eq!(step(View::Insert(1), bytes(b"ls"), 0x1c), (View::Insert(1), b"ls".to_vec()));
     }
 
     #[test]
     fn escape_to_normal() {
-        assert_eq!(step(View::Insert(1), Input::Escape), (View::Normal(1), vec![]));
+        assert_eq!(step(View::Insert(1), Input::Escape, 0x1c), (View::Normal(1), vec![]));
     }
 
     #[test]
     fn double_escape_sends_literal() {
-        assert_eq!(step(View::Normal(1), Input::Escape), (View::Insert(1), vec![0x1c]));
+        assert_eq!(step(View::Normal(1), Input::Escape, 0x1c), (View::Insert(1), vec![0x1c]));
     }
 }

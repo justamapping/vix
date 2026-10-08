@@ -126,6 +126,10 @@ Rust. Pure modules first, I/O at the edges.
 | `render` | io | draw list / view / status line (`crossterm`, maybe `ratatui`) |
 | `input` | io | parse stdin incl. kitty keyboard `CSI u` encodings of `<C-\>` |
 | `config` | io | `~/.config/vix/config.toml` keybinds |
+| `keyspec` | pure | vim key notation (`<C-d>`) -> keys |
+| `remap` | pure | non-recursive mappings with prefix waiting |
+| `session` | io | `--resume` snapshot |
+| `proc` | io | pid -> cwd |
 | `server` | io | later: daemon owns ptys, clients over unix socket |
 
 Status line is one row: `3/7 buzz  NORMAL [+]`. ptys are sized to `rows - 1`.
@@ -150,8 +154,20 @@ bracketed paste, app cursor) and cursor shape for the terminal you're typing int
 3. **view n**: scrollback as text buffer, motions, `J/K`, `<C-^>`, `/`, yank to clipboard (OSC 52).
    Done as a read-only buffer over the live vt (screen rows, wrapped lines are separate). Cursor on the last line
    follows output; elsewhere the text is pinned (drifts once the 10k scrollback is full).
-4. **status**: per-terminal running command, cwd (OSC 7), bell, exited; maybe as virtual text in list.
-5. **config**: keybinds from toml.
+4. **config**: `~/.config/vix/config.toml` (or `$XDG_CONFIG_HOME`), vim key notation, non-recursive maps.
+   Done as below. A broken config falls back to defaults and shows the error in the list.
+   ```toml
+   escape = "<C-Space>"   # any single ctrl key; default <C-\>; not <C-i> <C-m> <C-[> <C-h>
+   timeoutlen = 1000      # ms a partly typed mapping waits, like vim
+   [map.list]             # list normal + visual, like :noremap
+   "<C-j>" = "J"
+   [map.view]             # view n normal + visual
+   q = ":q<CR>"
+   ```
+   Also a minimal `vix --resume`: on exit the list (names, live cwd, last terminal) goes to
+   `~/.local/state/vix/last.toml`; no output or programs. Live cwd is asked from the OS (pid -> cwd, like tmux),
+   which also makes clone use the shell's current directory.
+5. **status**: per-terminal running command, bell, exited; maybe as virtual text in list. (cwd: `proc::cwd` exists)
 6. **server/client**: persistence, detach/attach, `$VIX` nesting depth, shell integration (`:x`/`:q` functions
    calling `vix ctl` over `$VIX_SOCKET`).
 7. **editable output**: option A or B.

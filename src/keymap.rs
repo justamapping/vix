@@ -179,6 +179,11 @@ pub fn parse(keys: &[Key]) -> Parsed {
     }
 }
 
+/// The next key is a literal argument (the target of `f` `t`), which mappings leave alone.
+pub fn awaits_char(keys: &[Key]) -> bool {
+    matches!(keys.last(), Some(Key::Char('f' | 'F' | 't' | 'T'))) && parse(keys) == Parsed::Pending
+}
+
 fn count(keys: &[Key]) -> (Option<usize>, &[Key]) {
     let mut n: Option<usize> = None;
     let mut i = 0;
@@ -233,6 +238,10 @@ mod tests {
         parse(&keys)
     }
 
+    fn keymap_awaits(s: &str) -> bool {
+        awaits_char(&s.chars().map(Key::Char).collect::<Vec<_>>())
+    }
+
     fn done(count: Option<usize>, action: Action) -> Parsed {
         Parsed::Done(Cmd { count, action })
     }
@@ -284,6 +293,7 @@ mod tests {
         assert_eq!(p("f"), Parsed::Pending);
         assert_eq!(p("fx"), done(None, f('x', false, false)));
         assert_eq!(p("2Tx"), done(Some(2), f('x', true, true)));
+        assert!(keymap_awaits("2dt") && keymap_awaits("F") && !keymap_awaits("gt") && !keymap_awaits("d"));
         assert_eq!(p("dt)"), done(None, Action::Operate(Operator::Delete, Target::Motion(Motion::Find { ch: ')', back: false, till: true }))));
     }
 }

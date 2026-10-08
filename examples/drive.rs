@@ -35,6 +35,7 @@ fn main() -> anyhow::Result<()> {
     let (rows, cols) = (size("DRIVE_ROWS", 12), size("DRIVE_COLS", 60));
     let pair = native_pty_system().openpty(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })?;
     let mut cmd = CommandBuilder::new(concat!(env!("CARGO_MANIFEST_DIR"), "/target/debug/vix"));
+    cmd.args(env::var("DRIVE_ARGS").unwrap_or_default().split_whitespace());
     cmd.cwd(env::current_dir()?);
     cmd.env("SHELL", env::var("DRIVE_SHELL").unwrap_or("/bin/sh".into()));
     cmd.env("PS1", "$ ");

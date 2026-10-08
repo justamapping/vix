@@ -20,17 +20,13 @@ pub enum Key {
     Right,
 }
 
-/// Splits a stdin chunk on `<C-\>`, raw or kitty-encoded (`CSI 92;5u`).
-pub fn split(bytes: &[u8]) -> Vec<Input> {
+/// Splits a stdin chunk on the escape key's byte, raw or kitty-encoded (`CSI 92;5u` for `<C-\>`).
+pub fn split(bytes: &[u8], esc: u8) -> Vec<Input> {
     let mut out = Vec::new();
     let mut pending = Vec::new();
     let mut i = 0;
     while i < bytes.len() {
-        let hit = if bytes[i] == CTRL_BACKSLASH {
-            Some((1, true))
-        } else {
-            kitty_ctrl_backslash(&bytes[i..])
-        };
+        let hit = if bytes[i] == esc { Some((1, true)) } else { kitty_ctrl(&bytes[i..], esc) };
         match hit {
             Some((len, press)) => {
                 if !pending.is_empty() {
@@ -53,8 +49,18 @@ pub fn split(bytes: &[u8]) -> Vec<Input> {
     out
 }
 
-/// Matches `CSI 92[;mods[:event]] u` with ctrl as the only modifier. Returns (len, is_press).
-fn kitty_ctrl_backslash(bytes: &[u8]) -> Option<(usize, bool)> {
+/// Whether kitty codepoint `key` with ctrl held is the key that sends legacy byte `esc`.
+fn is_ctrl_of(key: u32, esc: u8) -> bool {
+    match esc {
+        0 => key == 32 || key == 64,
+        1..=26 => key == 0x60 + esc as u32,
+        0x1c..=0x1f => key == 0x40 + esc as u32,
+        _ => false,
+    }
+}
+
+/// Matches `CSI key[;mods[:event]] u` for the escape key with ctrl as the only modifier. Returns (len, is_press).
+fn kitty_ctrl(bytes: &[u8], esc: u8) -> Option<(usize, bool)> {
     let body = bytes.strip_prefix(b"\x1b[")?;
     let end = body.iter().position(|b| !(b.is_ascii_digit() || *b == b';' || *b == b':'))?;
     if body[end] != b'u' {
@@ -62,13 +68,13 @@ fn kitty_ctrl_backslash(bytes: &[u8]) -> Option<(usize, bool)> {
     }
     let params = std::str::from_utf8(&body[..end]).ok()?;
     let mut fields = params.split(';');
-    let key = fields.next()?.split(':').next()?;
+    let key: u32 = fields.next()?.split(':').next()?.parse().ok()?;
     let mut mods = fields.next().unwrap_or("1").split(':');
     let modifiers: u32 = mods.next()?.parse().ok()?;
     let event: u32 = mods.next().unwrap_or("1").parse().ok()?;
     // ignore caps/num lock bits
     let ctrl_only = modifiers.checked_sub(1)? & 0b11_1111 == 4;
-    (key == "92" && ctrl_only).then_some((2 + end + 1, event != 3))
+    (is_ctrl_of(key, esc) && ctrl_only).then_some((2 + end + 1, event != 3))
 }
 
 #[cfg(test)]
@@ -139,36 +145,43 @@ mod tests {
 
     #[test]
     fn plain_bytes_pass_through() {
-        assert_eq!(split(b"ls\r"), vec![bytes(b"ls\r")]);
-        assert_eq!(split(b"\x1b[A"), vec![bytes(b"\x1b[A")]);
+        assert_eq!(split(b"ls\r", CTRL_BACKSLASH), vec![bytes(b"ls\r")]);
+        assert_eq!(split(b"\x1b[A", CTRL_BACKSLASH), vec![bytes(b"\x1b[A")]);
     }
 
     #[test]
     fn raw_escape() {
-        assert_eq!(split(b"\x1c"), vec![Input::Escape]);
-        assert_eq!(split(b"\x1c\x1c"), vec![Input::Escape, Input::Escape]);
-        assert_eq!(split(b"ab\x1ccd"), vec![bytes(b"ab"), Input::Escape, bytes(b"cd")]);
+        assert_eq!(split(b"\x1c", CTRL_BACKSLASH), vec![Input::Escape]);
+        assert_eq!(split(b"\x1c\x1c", CTRL_BACKSLASH), vec![Input::Escape, Input::Escape]);
+        assert_eq!(split(b"ab\x1ccd", CTRL_BACKSLASH), vec![bytes(b"ab"), Input::Escape, bytes(b"cd")]);
     }
 
     #[test]
     fn kitty_escape() {
-        assert_eq!(split(b"\x1b[92;5u"), vec![Input::Escape]);
-        assert_eq!(split(b"\x1b[92;5:1u"), vec![Input::Escape]);
-        assert_eq!(split(b"\x1b[92;5:2u"), vec![Input::Escape]);
-        assert_eq!(split(b"\x1b[92;69u"), vec![Input::Escape]);
-        assert_eq!(split(b"x\x1b[92;5ui"), vec![bytes(b"x"), Input::Escape, bytes(b"i")]);
+        assert_eq!(split(b"\x1b[92;5u", CTRL_BACKSLASH), vec![Input::Escape]);
+        assert_eq!(split(b"\x1b[92;5:1u", CTRL_BACKSLASH), vec![Input::Escape]);
+        assert_eq!(split(b"\x1b[92;5:2u", CTRL_BACKSLASH), vec![Input::Escape]);
+        assert_eq!(split(b"\x1b[92;69u", CTRL_BACKSLASH), vec![Input::Escape]);
+        assert_eq!(split(b"x\x1b[92;5ui", CTRL_BACKSLASH), vec![bytes(b"x"), Input::Escape, bytes(b"i")]);
+    }
+
+    #[test]
+    fn other_escape_keys() {
+        assert_eq!(split(b"a\x00b\x1c", 0), vec![bytes(b"a"), Input::Escape, bytes(b"b\x1c")]);
+        assert_eq!(split(b"\x1b[32;5u\x1b[97;5u", 0), vec![Input::Escape, bytes(b"\x1b[97;5u")]);
+        assert_eq!(split(b"\x1b[97;5u", 1), vec![Input::Escape]);
     }
 
     #[test]
     fn kitty_release_is_swallowed() {
-        assert_eq!(split(b"\x1b[92;5:3u"), vec![]);
+        assert_eq!(split(b"\x1b[92;5:3u", CTRL_BACKSLASH), vec![]);
     }
 
     #[test]
     fn kitty_other_keys_pass_through() {
-        assert_eq!(split(b"\x1b[92u"), vec![bytes(b"\x1b[92u")]);
-        assert_eq!(split(b"\x1b[92;7u"), vec![bytes(b"\x1b[92;7u")]);
-        assert_eq!(split(b"\x1b[97;5u"), vec![bytes(b"\x1b[97;5u")]);
+        assert_eq!(split(b"\x1b[92u", CTRL_BACKSLASH), vec![bytes(b"\x1b[92u")]);
+        assert_eq!(split(b"\x1b[92;7u", CTRL_BACKSLASH), vec![bytes(b"\x1b[92;7u")]);
+        assert_eq!(split(b"\x1b[97;5u", CTRL_BACKSLASH), vec![bytes(b"\x1b[97;5u")]);
     }
 
     #[test]

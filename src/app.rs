@@ -3,15 +3,19 @@ use std::io::{self, ErrorKind, Read, Write};
 use std::path::PathBuf;
 use std::sync::mpsc::Sender;
 use std::thread;
+use std::time::Instant;
 
 use anyhow::Result;
 use ratatui::DefaultTerminal;
 
 use crate::buffer::{self, Buffer, Effect, Line};
+use crate::config::Config;
 use crate::input::{self, Input, Key};
 use crate::listdiff::{self, Op};
+use crate::proc;
 use crate::pty::Pty;
 use crate::render;
+use crate::session::{Saved, Session};
 use crate::state::{self, View};
 use crate::vt::{self, Modes};
 
@@ -29,6 +33,13 @@ pub struct Term {
     cwd: PathBuf,
     pty: Pty,
     vt: vt::Parser,
+}
+
+impl Term {
+    /// Where the shell is now, falling back to where it started.
+    fn cwd(&self) -> PathBuf {
+        self.pty.pid().and_then(proc::cwd).unwrap_or_else(|| self.cwd.clone())
+    }
 }
 
 pub struct App {
@@ -51,6 +62,9 @@ pub struct App {
     alt: Option<u64>,
     /// list row to open once the user answers the write prompt
     confirm: Option<usize>,
+    config: Config,
+    /// when a partly typed mapping gives up waiting
+    pub deadline: Option<Instant>,
     pub quit: bool,
 }
 
@@ -75,13 +89,16 @@ pub fn pump(mut src: impl Read + Send + 'static, tx: Sender<Event>, wrap: impl F
 }
 
 impl App {
-    pub fn new(tx: Sender<Event>, cols: u16, rows: u16) -> Result<Self> {
+    pub fn new(tx: Sender<Event>, cols: u16, rows: u16, config: Config, session: Session) -> Result<Self> {
         let cwd = std::env::current_dir()?;
         let mut normal = Buffer::new(Vec::new());
         normal.readonly = true;
+        normal.maps = config.view.clone();
+        let mut list = Buffer::new(Vec::new());
+        list.maps = config.list.clone();
         let mut app = Self {
             terms: Vec::new(),
-            list: Buffer::new(Vec::new()),
+            list,
             normal,
             view: View::List,
             next_id: 0,
@@ -95,13 +112,34 @@ impl App {
             last: None,
             alt: None,
             confirm: None,
+            config,
+            deadline: None,
             quit: false,
         };
         app.size_buffers();
-        let first = app.spawn("Untitled".into(), cwd)?;
-        app.terms.push(first);
+        let mut saved = session.terms;
+        if saved.is_empty() {
+            saved.push(Saved { name: "Untitled".into(), cwd: cwd.clone() });
+        }
+        for Saved { name, cwd: dir } in saved {
+            let dir = if dir.is_dir() { dir } else { cwd.clone() };
+            let t = app.spawn(name, dir)?;
+            app.terms.push(t);
+        }
         app.list.load(app.lines());
+        app.list.place((session.cursor, 0), 0);
         Ok(app)
+    }
+
+    /// The list as `--resume` will bring it back.
+    pub fn snapshot(&self) -> Session {
+        let terms = self.terms.iter().map(|t| Saved { name: t.name.clone(), cwd: t.cwd() }).collect();
+        let at = self.viewing().or(self.last).and_then(|id| self.terms.iter().position(|t| t.id == id));
+        Session { cursor: at.unwrap_or(self.list.cursor.0), terms }
+    }
+
+    pub fn message(&mut self, msg: String) {
+        self.list.message = Some(msg);
     }
 
     fn size_buffers(&mut self) {
@@ -255,18 +293,40 @@ impl App {
                     self.normal.mode,
                     self.list.mode
                 ));
-                for input in input::split(&bytes) {
+                for input in input::split(&bytes, self.config.escape) {
                     self.input(input)?;
                 }
+                let waiting = match self.view {
+                    View::List => self.list.waiting(),
+                    View::Normal(_) => self.normal.waiting(),
+                    View::Insert(_) => false,
+                };
+                self.deadline = waiting.then(|| Instant::now() + self.config.timeout);
                 Ok(true)
             }
+        }
+    }
+
+    /// The mapping timeout passed: run the keys it was holding.
+    pub fn flush(&mut self) -> Result<()> {
+        self.deadline = None;
+        match self.view {
+            View::List => {
+                let effects = self.list.flush();
+                self.list_effects(effects)
+            }
+            View::Normal(id) => {
+                let effects = self.normal.flush();
+                self.normal_effects(id, effects)
+            }
+            View::Insert(_) => Ok(()),
         }
     }
 
     fn input(&mut self, input: Input) -> Result<()> {
         let bytes = match (self.view, input) {
             (View::Insert(id), input) => {
-                let (next, out) = state::step(self.view, input);
+                let (next, out) = state::step(self.view, input, self.config.escape);
                 if let Some(t) = self.term(id)
                     && !out.is_empty()
                 {
@@ -280,7 +340,7 @@ impl App {
             }
             (View::Normal(id), Input::Escape) => {
                 if std::mem::take(&mut self.fresh) {
-                    let (next, out) = state::step(self.view, Input::Escape);
+                    let (next, out) = state::step(self.view, Input::Escape, self.config.escape);
                     if let Some(t) = self.term(id) {
                         t.pty.write(&out)?;
                     }
@@ -314,6 +374,10 @@ impl App {
         self.refresh_normal();
         let effects = self.normal.key(key);
         crate::log::log(format_args!("  normal {key:?} -> {:?} {effects:?}", self.normal.mode));
+        self.normal_effects(id, effects)
+    }
+
+    fn normal_effects(&mut self, id: u64, effects: Vec<Effect>) -> Result<()> {
         for effect in effects {
             match effect {
                 Effect::Insert => self.set_view(View::Insert(id)),
@@ -370,7 +434,12 @@ impl App {
             }
             return Ok(());
         }
-        for effect in self.list.key(key) {
+        let effects = self.list.key(key);
+        self.list_effects(effects)
+    }
+
+    fn list_effects(&mut self, effects: Vec<Effect>) -> Result<()> {
+        for effect in effects {
             match effect {
                 Effect::Open(row) => {
                     let summary = self.pending_summary();
@@ -434,7 +503,7 @@ impl App {
                     continue;
                 }
                 Op::Clone { from, name } => {
-                    let cwd = next.iter().find(|t| t.id == from).map_or(self.cwd.clone(), |t| t.cwd.clone());
+                    let cwd = next.iter().find(|t| t.id == from).map_or(self.cwd.clone(), Term::cwd);
                     self.spawn(name, cwd)
                 }
                 Op::Spawn { name } => self.spawn(name, self.cwd.clone()),

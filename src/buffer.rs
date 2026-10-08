@@ -1,6 +1,7 @@
 use crate::input::Key;
 use crate::keymap::{self, Action, Cmd, InsertAt, Motion, Operator, Parsed, Scroll, Target};
 use crate::motion::{self, Pos};
+use crate::remap::{self, Map};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Line {
@@ -52,6 +53,9 @@ pub struct Buffer {
     /// first visible row and how many rows are visible
     pub top: usize,
     pub height: usize,
+    /// normal and visual mode mappings
+    pub maps: Vec<Map>,
+    typeahead: Vec<Key>,
     anchor: Pos,
     saved: Vec<Line>,
     pending: Vec<Key>,
@@ -93,6 +97,8 @@ impl Buffer {
             readonly: false,
             top: 0,
             height: 1,
+            maps: Vec::new(),
+            typeahead: Vec::new(),
             anchor: (0, 0),
             saved: Vec::new(),
             pending: Vec::new(),
@@ -112,6 +118,7 @@ impl Buffer {
         self.redo.clear();
         self.mode = Mode::Normal;
         self.pending.clear();
+        self.typeahead.clear();
         self.refresh(lines);
     }
 
@@ -155,6 +162,29 @@ impl Buffer {
     }
 
     pub fn key(&mut self, key: Key) -> Vec<Effect> {
+        let mappable = matches!(self.mode, Mode::Normal | Mode::Visual { .. }) && !keymap::awaits_char(&self.pending);
+        if self.maps.is_empty() || !mappable {
+            return self.press(key);
+        }
+        self.typeahead.push(key);
+        let (keys, wait) = remap::resolve(&self.maps, &self.typeahead, false);
+        self.typeahead = wait;
+        keys.into_iter().flat_map(|k| self.press(k)).collect()
+    }
+
+    /// A mapping is waiting on more keys.
+    pub fn waiting(&self) -> bool {
+        !self.typeahead.is_empty()
+    }
+
+    /// Stops waiting after the timeout and runs what was typed.
+    pub fn flush(&mut self) -> Vec<Effect> {
+        let typed = std::mem::take(&mut self.typeahead);
+        let (keys, _) = remap::resolve(&self.maps, &typed, true);
+        keys.into_iter().flat_map(|k| self.press(k)).collect()
+    }
+
+    fn press(&mut self, key: Key) -> Vec<Effect> {
         if matches!(self.mode, Mode::Normal | Mode::Visual { .. }) {
             self.message = None;
         }
@@ -862,5 +892,27 @@ mod tests {
         b.remove_id(0);
         assert_eq!(ids(&b), vec![(None, "web"), (Some(1), "bar")]);
         assert!(b.modified());
+    }
+
+    #[test]
+    fn mappings() {
+        let map = |l: &str, r: &str| Map { lhs: crate::keyspec::parse(l).unwrap(), rhs: crate::keyspec::parse(r).unwrap() };
+        let mut b = view(&["one", "two", "three"]);
+        b.maps = vec![map("<C-j>", "J"), map("q", ":q<CR>"), map("gx", "G"), map("j", "k")];
+        assert_eq!(feed(&mut b, "\x0a"), vec![Effect::Switch(1)]);
+        assert_eq!(feed(&mut b, "q"), vec![Effect::Quit { force: false }]);
+        // f's target is literal, and mapped rhs isn't remapped
+        feed(&mut b, "G0fj");
+        assert_eq!(b.cursor, (2, 0));
+        feed(&mut b, "g");
+        assert!(b.waiting());
+        feed(&mut b, "g");
+        assert_eq!(b.cursor, (2, 0));
+        b.flush();
+        feed(&mut b, "gx");
+        assert_eq!(b.cursor, (2, 0));
+        // the command line isn't mapped
+        assert_eq!(feed(&mut b, ":qj"), vec![]);
+        assert_eq!(b.cmdline, "qj");
     }
 }
