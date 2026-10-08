@@ -17,6 +17,7 @@ pub enum Motion {
     LineEnd,
     FirstLine,
     LastLine,
+    Find { ch: char, back: bool, till: bool },
 }
 
 impl Motion {
@@ -25,7 +26,7 @@ impl Motion {
     }
 
     pub fn inclusive(self) -> bool {
-        matches!(self, Motion::LineEnd | Motion::WordEnd | Motion::BigWordEnd)
+        matches!(self, Motion::LineEnd | Motion::WordEnd | Motion::BigWordEnd | Motion::Find { back: false, .. })
     }
 }
 
@@ -52,6 +53,20 @@ pub enum InsertAt {
     Above,
 }
 
+/// Viewport moves: `<C-e> <C-y> <C-d> <C-u> <C-f> <C-b> H M L`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Scroll {
+    LineDown,
+    LineUp,
+    HalfDown,
+    HalfUp,
+    PageDown,
+    PageUp,
+    Top,
+    Middle,
+    Bottom,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Action {
     Move(Motion),
@@ -62,6 +77,14 @@ pub enum Action {
     Redo,
     Open,
     Command,
+    Search { back: bool },
+    SearchNext { reverse: bool },
+    RepeatFind { reverse: bool },
+    Visual { line: bool },
+    Scroll(Scroll),
+    Parent,
+    Switch { back: bool },
+    Alternate,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -128,6 +151,27 @@ pub fn parse(keys: &[Key]) -> Parsed {
         Key::Ctrl('r') => done(Action::Redo),
         Key::Enter => done(Action::Open),
         Key::Char(':') => done(Action::Command),
+        Key::Char('/') => done(Action::Search { back: false }),
+        Key::Char('?') => done(Action::Search { back: true }),
+        Key::Char('n') => done(Action::SearchNext { reverse: false }),
+        Key::Char('N') => done(Action::SearchNext { reverse: true }),
+        Key::Char(';') => done(Action::RepeatFind { reverse: false }),
+        Key::Char(',') => done(Action::RepeatFind { reverse: true }),
+        Key::Char('v') => done(Action::Visual { line: false }),
+        Key::Char('V') => done(Action::Visual { line: true }),
+        Key::Char('-') => done(Action::Parent),
+        Key::Char('J') => done(Action::Switch { back: false }),
+        Key::Char('K') => done(Action::Switch { back: true }),
+        Key::Ctrl('^') => done(Action::Alternate),
+        Key::Ctrl('e') => done(Action::Scroll(Scroll::LineDown)),
+        Key::Ctrl('y') => done(Action::Scroll(Scroll::LineUp)),
+        Key::Ctrl('d') => done(Action::Scroll(Scroll::HalfDown)),
+        Key::Ctrl('u') => done(Action::Scroll(Scroll::HalfUp)),
+        Key::Ctrl('f') => done(Action::Scroll(Scroll::PageDown)),
+        Key::Ctrl('b') => done(Action::Scroll(Scroll::PageUp)),
+        Key::Char('H') => done(Action::Scroll(Scroll::Top)),
+        Key::Char('M') => done(Action::Scroll(Scroll::Middle)),
+        Key::Char('L') => done(Action::Scroll(Scroll::Bottom)),
         _ => match motion(rest) {
             Parsed::Done(cmd) => Parsed::Done(Cmd { count, ..cmd }),
             other => other,
@@ -165,6 +209,11 @@ fn motion(keys: &[Key]) -> Parsed {
         Key::Char('^') => FirstNonBlank,
         Key::Char('$') => LineEnd,
         Key::Char('G') => LastLine,
+        Key::Char(c @ ('f' | 'F' | 't' | 'T')) => match keys.get(1) {
+            None => return Parsed::Pending,
+            Some(Key::Char(ch)) => Find { ch: *ch, back: c.is_ascii_uppercase(), till: c.eq_ignore_ascii_case(&'t') },
+            Some(_) => return Parsed::Invalid,
+        },
         Key::Char('g') => match keys.get(1) {
             None => return Parsed::Pending,
             Some(Key::Char('g')) => FirstLine,
@@ -225,5 +274,16 @@ mod tests {
         assert_eq!(p(":"), done(None, Action::Command));
         assert_eq!(parse(&[Key::Enter]), done(None, Action::Open));
         assert_eq!(p("Z"), Parsed::Invalid);
+        assert_eq!(p("3J"), done(Some(3), Action::Switch { back: false }));
+        assert_eq!(parse(&[Key::Ctrl('^')]), done(None, Action::Alternate));
+    }
+
+    #[test]
+    fn find_takes_a_char() {
+        let f = |ch, back, till| Action::Move(Motion::Find { ch, back, till });
+        assert_eq!(p("f"), Parsed::Pending);
+        assert_eq!(p("fx"), done(None, f('x', false, false)));
+        assert_eq!(p("2Tx"), done(Some(2), f('x', true, true)));
+        assert_eq!(p("dt)"), done(None, Action::Operate(Operator::Delete, Target::Motion(Motion::Find { ch: ')', back: false, till: true }))));
     }
 }

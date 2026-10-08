@@ -1,4 +1,5 @@
-use vt100::{MouseProtocolEncoding, MouseProtocolMode};
+use base64::Engine;
+use vt100::{MouseProtocolEncoding, MouseProtocolMode, Screen};
 
 pub type Parser = vt100::Parser<Callbacks>;
 
@@ -37,6 +38,36 @@ impl vt100::Callbacks for Callbacks {
 
 pub fn parser(cols: u16, rows: u16) -> Parser {
     vt100::Parser::new_with_callbacks(rows, cols, SCROLLBACK, Callbacks::default())
+}
+
+/// Rows of scrollback above the screen.
+pub fn history(screen: &mut Screen) -> usize {
+    screen.set_scrollback(usize::MAX);
+    let n = screen.scrollback();
+    screen.set_scrollback(0);
+    n
+}
+
+/// Scrollback then screen, one string per row.
+pub fn text(screen: &mut Screen) -> Vec<String> {
+    let (rows, cols) = screen.size();
+    let total = history(screen);
+    let len = total + rows as usize;
+    let mut lines = Vec::with_capacity(len);
+    while lines.len() < len {
+        let offset = total.saturating_sub(lines.len());
+        screen.set_scrollback(offset);
+        let first = total - offset;
+        let skip = lines.len() - first;
+        lines.extend(screen.rows(0, cols).skip(skip));
+    }
+    screen.set_scrollback(0);
+    lines
+}
+
+/// Sets the outer terminal's clipboard.
+pub fn osc52(text: &str) -> Vec<u8> {
+    format!("\x1b]52;c;{}\x07", base64::engine::general_purpose::STANDARD.encode(text)).into_bytes()
 }
 
 /// Outer-terminal state a program expects while it has the keyboard.
@@ -96,6 +127,27 @@ mod tests {
         let mut p = parser(80, 24);
         p.process(bytes);
         p
+    }
+
+    #[test]
+    fn text_includes_scrollback() {
+        let mut p = vt100::Parser::new_with_callbacks(3, 10, SCROLLBACK, Callbacks::default());
+        p.process(b"1\r\n2\r\n3\r\n4\r\n5\r\n6\r\n7");
+        let s = p.screen_mut();
+        assert_eq!(history(s), 4);
+        assert_eq!(text(s), ["1", "2", "3", "4", "5", "6", "7"]);
+        assert_eq!(s.scrollback(), 0);
+    }
+
+    #[test]
+    fn text_without_scrollback() {
+        let mut p = feed(b"hi");
+        assert_eq!(text(p.screen_mut()).len(), 24);
+    }
+
+    #[test]
+    fn osc52_encodes() {
+        assert_eq!(osc52("hi"), b"\x1b]52;c;aGk=\x07");
     }
 
     #[test]

@@ -4,6 +4,7 @@ mod config;
 mod input;
 mod keymap;
 mod listdiff;
+mod log;
 mod motion;
 mod pty;
 mod render;

@@ -60,7 +60,51 @@ pub fn apply(lines: &[String], pos: Pos, motion: Motion, count: Option<usize>) -
             let big = motion == Motion::BigWordEnd;
             (0..n).fold(pos, |p, _| word_end(lines, p, big))
         }
+        Motion::Find { ch, back, till } => find(&chars(lines, row), col, ch, back, till, n).map_or(pos, |c| (row, c)),
     }
+}
+
+/// Next plain-text match of `pat` from `pos`, wrapping around. Returns the match and whether it wrapped.
+pub fn search(lines: &[String], pos: Pos, pat: &str, back: bool) -> Option<(Pos, bool)> {
+    if pat.is_empty() || lines.is_empty() {
+        return None;
+    }
+    let cols = |r: usize| -> Vec<usize> {
+        let line = &lines[r];
+        line.match_indices(pat).map(|(b, _)| line[..b].chars().count()).collect()
+    };
+    let (row, col) = pos;
+    let len = lines.len();
+    for k in 0..=len {
+        let (r, wrapped) = if back { ((row + len - k % len) % len, k > row) } else { ((row + k) % len, row + k >= len) };
+        let hits = cols(r);
+        let first = k == 0;
+        let last = k == len;
+        let hit = if back {
+            hits.into_iter().rev().find(|&c| (!first || c < col) && (!last || c >= col))
+        } else {
+            hits.into_iter().find(|&c| (!first || c > col) && (!last || c <= col))
+        };
+        if let Some(c) = hit {
+            return Some(((r, c), wrapped));
+        }
+    }
+    None
+}
+
+/// `f t F T` within the line; None if there aren't `n` matches.
+pub fn find(line: &[char], col: usize, ch: char, back: bool, till: bool, n: usize) -> Option<usize> {
+    let at = |i: &usize| line[*i] == ch;
+    let hit = if back {
+        (0..col.min(line.len())).rev().filter(at).nth(n - 1)?
+    } else {
+        (col + 1..line.len()).filter(at).nth(n - 1)?
+    };
+    Some(match (till, back) {
+        (true, false) => hit - 1,
+        (true, true) => hit + 1,
+        _ => hit,
+    })
 }
 
 fn word_fwd(lines: &[String], (mut row, mut col): Pos, big: bool) -> Pos {
@@ -170,6 +214,32 @@ mod tests {
         assert_eq!(apply(&l, (0, 0), LineEnd, None), (0, 8));
         assert_eq!(apply(&l, (0, 7), Right, Some(5)), (0, 9));
         assert_eq!(apply(&l, (0, 1), Left, Some(5)), (0, 0));
+    }
+
+    #[test]
+    fn search_wraps() {
+        let l = lines(&["foo bar", "baz", "bar foo"]);
+        assert_eq!(search(&l, (0, 0), "bar", false), Some(((0, 4), false)));
+        assert_eq!(search(&l, (0, 4), "bar", false), Some(((2, 0), false)));
+        assert_eq!(search(&l, (2, 0), "bar", false), Some(((0, 4), true)));
+        assert_eq!(search(&l, (2, 0), "bar", true), Some(((0, 4), false)));
+        assert_eq!(search(&l, (0, 4), "bar", true), Some(((2, 0), true)));
+        assert_eq!(search(&l, (0, 0), "foo", false), Some(((2, 4), false)));
+        assert_eq!(search(&l, (0, 0), "foo", true), Some(((2, 4), true)));
+        assert_eq!(search(&["only foo".into()], (0, 5), "foo", false), Some(((0, 5), true)));
+        assert_eq!(search(&l, (0, 0), "nope", false), None);
+    }
+
+    #[test]
+    fn find_in_line() {
+        let l = lines(&["a(b, c(d))"]);
+        let m = |ch, back, till| Find { ch, back, till };
+        assert_eq!(apply(&l, (0, 0), m('(', false, false), None), (0, 1));
+        assert_eq!(apply(&l, (0, 0), m('(', false, false), Some(2)), (0, 6));
+        assert_eq!(apply(&l, (0, 0), m(')', false, true), None), (0, 7));
+        assert_eq!(apply(&l, (0, 9), m('(', true, false), None), (0, 6));
+        assert_eq!(apply(&l, (0, 9), m('(', true, true), None), (0, 7));
+        assert_eq!(apply(&l, (0, 0), m('z', false, false), None), (0, 0));
     }
 
     #[test]

@@ -19,12 +19,16 @@ State is two axes: **view × mode**.
 ### transitions
 
 ```
+vix                  list n      one terminal, "Untitled"
 list n   --<CR>-->   view i      open terminal under cursor, start typing, i.e. go into view<i>
-view i   --<C-\>-->  view n      the only key vix steals; <C-\><C-\> sends a literal. our <Esc> key of vim
-view n   --i/a-->    view i
-view n   -- - -->    list n      (oil's "go up")
+view i   --<C-\>-->  view n      the only key vix steals; our <Esc> key of vim
+view n   --<C-\>-->  view i      only right after entering, and sends a literal <C-\>; otherwise a no-op like <Esc>
+view n   --i/a-->    view i      (any insert key: i a I A o O)
+view n   -- - -->    list n      (oil's "go up"); also :q, :x
+view n   --:q!-->    list n      kills the terminal and drops its line
 view n   --J/K-->    view n      next/prev terminal, counts work (3J)
 view n   --<C-^>-->  view n      alternate terminal
+any      --:qa-->    quit vix    (:q only quits from the list)
 ```
 
 ## list view
@@ -62,8 +66,9 @@ So `yyp`, `Vjy` + `p`, `dd`, `ddp`, `cw`, `o` all fall out of plain text editing
 
 ### unwritten changes
 
-Behave like vim's `hidden`: `<CR>` into a terminal with a modified buffer is allowed, status shows `[+]`.
-`<CR>` on a line with no id (not yet written) errors: "not written".
+`<CR>` with a modified buffer asks first: "clone foo as web, kill api. write? [y/n]"; `y` writes, then opens the
+line under the cursor (including a line that was just spawned). Edits that change nothing (blank lines) write silently.
+A terminal that exits or is killed loses its lines from the list, even when the list has unsaved edits.
 
 ## view mode
 
@@ -143,6 +148,8 @@ bracketed paste, app cursor) and cursor shape for the terminal you're typing int
 2. **state machine + list**: `state`, `keymap`, `listdiff` with tests. Multiple terminals, `j k gg G <CR> o dd yy p
    cw i <Esc> :w u`, redraw from emulator on switch.
 3. **view n**: scrollback as text buffer, motions, `J/K`, `<C-^>`, `/`, yank to clipboard (OSC 52).
+   Done as a read-only buffer over the live vt (screen rows, wrapped lines are separate). Cursor on the last line
+   follows output; elsewhere the text is pinned (drifts once the 10k scrollback is full).
 4. **status**: per-terminal running command, cwd (OSC 7), bell, exited; maybe as virtual text in list.
 5. **config**: keybinds from toml.
 6. **server/client**: persistence, detach/attach, `$VIX` nesting depth, shell integration (`:x`/`:q` functions
@@ -157,6 +164,7 @@ bracketed paste, app cursor) and cursor shape for the terminal you're typing int
 - homemade vim vs `nvim --embed` once the list and view n exist
 - `:x` vs `:q` from inside a shell: `:q` = back to list (vim never destroys on `:q`), `:q!` = kill?
 - `/` from list: search names only, or scrollback too (jump to terminal + match line)?
+- restrict names to letters and numbers, so the rest of the line is free for comments/annotations (`web  # dev server`)
 
 ## answers
 - blended state for now

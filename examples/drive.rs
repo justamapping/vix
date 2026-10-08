@@ -31,11 +31,12 @@ fn unescape(s: &str) -> Vec<u8> {
 }
 
 fn main() -> anyhow::Result<()> {
-    let (rows, cols) = (12, 60);
+    let size = |k: &str, d: u16| env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
+    let (rows, cols) = (size("DRIVE_ROWS", 12), size("DRIVE_COLS", 60));
     let pair = native_pty_system().openpty(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })?;
     let mut cmd = CommandBuilder::new(concat!(env!("CARGO_MANIFEST_DIR"), "/target/debug/vix"));
     cmd.cwd(env::current_dir()?);
-    cmd.env("SHELL", "/bin/sh");
+    cmd.env("SHELL", env::var("DRIVE_SHELL").unwrap_or("/bin/sh".into()));
     cmd.env("PS1", "$ ");
     let mut child = pair.slave.spawn_command(cmd)?;
     drop(pair.slave);

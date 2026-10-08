@@ -29,6 +29,32 @@ pub fn diff(old: &[u64], new: &[Line]) -> Vec<Op> {
     ops
 }
 
+/// Human summary of what `ops` would do to `old` (id, name) terminals, e.g. "spawn web, kill api". Empty if nothing.
+pub fn summary(old: &[(u64, &str)], ops: &[Op]) -> String {
+    let name = |id: u64| old.iter().find(|(i, _)| *i == id).map_or("?", |(_, n)| n);
+    let mut parts = Vec::new();
+    let mut kept = Vec::new();
+    for op in ops {
+        match op {
+            Op::Keep { id, name: new } => {
+                kept.push(*id);
+                if name(*id) != new {
+                    parts.push(format!("rename {} to {new}", name(*id)));
+                }
+            }
+            Op::Clone { from, name: new } if name(*from) == new => parts.push(format!("clone {new}")),
+            Op::Clone { from, name: new } => parts.push(format!("clone {} as {new}", name(*from))),
+            Op::Spawn { name } => parts.push(format!("spawn {name}")),
+            Op::Kill { id } => parts.push(format!("kill {}", name(*id))),
+        }
+    }
+    let before: Vec<u64> = old.iter().map(|(id, _)| *id).filter(|id| kept.contains(id)).collect();
+    if before != kept {
+        parts.insert(0, "reorder".into());
+    }
+    parts.join(", ")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -85,5 +111,16 @@ mod tests {
     fn blank_lines_ignored() {
         let new = [line(None, ""), line(Some(1), "  "), line(Some(2), " bar ")];
         assert_eq!(diff(&[1, 2], &new), vec![keep(2, "bar"), Op::Kill { id: 1 }]);
+    }
+
+    #[test]
+    fn summaries() {
+        let old = [(1, "foo"), (2, "api")];
+        let new = [line(Some(1), "foo"), line(Some(1), "foo"), line(Some(1), "web2"), line(None, "web")];
+        assert_eq!(summary(&old, &diff(&[1, 2], &new)), "clone foo, clone foo as web2, spawn web, kill api");
+        let new = [line(Some(2), "api"), line(Some(1), "bar")];
+        assert_eq!(summary(&old, &diff(&[1, 2], &new)), "reorder, rename foo to bar");
+        let new = [line(Some(1), "foo"), line(None, ""), line(Some(2), "api")];
+        assert_eq!(summary(&old, &diff(&[1, 2], &new)), "");
     }
 }

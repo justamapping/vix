@@ -71,8 +71,13 @@ fn kitty_ctrl_backslash(bytes: &[u8]) -> Option<(usize, bool)> {
     (key == "92" && ctrl_only).then_some((2 + end + 1, event != 3))
 }
 
-/// Decodes legacy terminal input into keys. A lone ESC in a chunk is `<Esc>`.
+#[cfg(test)]
 pub fn keys(bytes: &[u8]) -> Vec<Key> {
+    spans(bytes).into_iter().map(|(k, _)| k).collect()
+}
+
+/// Decodes legacy terminal input into keys, each with the byte offset where it ends. A lone ESC in a chunk is `<Esc>`.
+pub fn spans(bytes: &[u8]) -> Vec<(Key, usize)> {
     let mut out = Vec::new();
     let mut i = 0;
     while i < bytes.len() {
@@ -119,7 +124,7 @@ pub fn keys(bytes: &[u8]) -> Vec<Key> {
                 }
             }
         };
-        out.push(key);
+        out.push((key, i));
     }
     out
 }
@@ -175,5 +180,6 @@ mod tests {
         assert_eq!(keys(b"\x7f\x12\x1c"), vec![Backspace, Ctrl('r'), Ctrl('\\')]);
         assert_eq!(keys("é".as_bytes()), vec![Char('é')]);
         assert_eq!(keys(b"\x1b[200~x"), vec![Char('x')]);
+        assert_eq!(spans(b"i\x1b[Ax"), vec![(Char('i'), 1), (Up, 4), (Char('x'), 5)]);
     }
 }

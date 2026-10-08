@@ -1,55 +1,88 @@
 use ratatui::Frame;
-use ratatui::layout::Position;
+use ratatui::layout::{Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Line;
-use ratatui::widgets::Paragraph;
+use ratatui::widgets::{Clear, Paragraph};
+use unicode_width::UnicodeWidthStr;
 
 use crate::buffer::{Buffer, Mode};
 
-/// First visible row so that `row` stays on screen.
-pub fn scroll(top: usize, row: usize, height: usize) -> usize {
-    if row < top {
-        row
-    } else if row >= top + height {
-        row + 1 - height
-    } else {
-        top
+/// Screen column of char index `col`.
+fn x_of(text: &str, col: usize) -> u16 {
+    text.chars().take(col).collect::<String>().width() as u16
+}
+
+/// What the bottom row says, vim-style.
+fn status(buf: &Buffer) -> String {
+    match (&buf.mode, &buf.message) {
+        (Mode::Command, _) => format!("{}{}", buf.prompt, buf.cmdline),
+        (_, Some(msg)) => msg.clone(),
+        (Mode::Insert, _) => "-- INSERT --".into(),
+        (Mode::Visual { line: false }, _) => "-- VISUAL --".into(),
+        (Mode::Visual { line: true }, _) => "-- VISUAL LINE --".into(),
+        (Mode::Normal, _) => String::new(),
     }
 }
 
-pub fn list(frame: &mut Frame, buf: &Buffer, top: usize) {
+/// Reverses the visual selection's visible cells, with `top` the buffer row at y = 0.
+fn highlight(frame: &mut Frame, buf: &Buffer, top: usize, height: u16) {
+    let Some(((r0, c0), (r1, c1), line)) = buf.selection() else { return };
+    let width = frame.area().width;
+    let out = frame.buffer_mut();
+    for y in 0..height {
+        let row = top + y as usize;
+        if row < r0 || row > r1 {
+            continue;
+        }
+        let text = &buf.lines[row].text;
+        let (x0, x1) = if line {
+            (0, width)
+        } else {
+            let start = if row == r0 { x_of(text, c0) } else { 0 };
+            let end = if row == r1 { x_of(text, c1 + 1).max(start + 1) } else { x_of(text, usize::MAX).max(1) };
+            (start, end)
+        };
+        for x in x0..x1.min(width) {
+            out[(x, y)].modifier.toggle(Modifier::REVERSED);
+        }
+    }
+}
+
+/// Draws the bottom row (if `always` or there's something to say) and places the cursor.
+fn chrome(frame: &mut Frame, buf: &Buffer, top: usize, always: bool) {
     let area = frame.area();
-    let height = area.height.saturating_sub(1) as usize;
+    let bottom = area.height.saturating_sub(1);
+    let status = status(buf);
+    let row = Rect { y: bottom, height: 1, ..area };
+    if always || !status.is_empty() {
+        frame.render_widget(Clear, row);
+        frame.render_widget(Paragraph::new(status.as_str()), row);
+    }
+    if always && buf.modified() {
+        frame.render_widget(Paragraph::new("[+]").right_aligned(), row);
+    }
+    let cursor = if buf.mode == Mode::Command {
+        Position::new(1 + buf.cmdline.width() as u16, bottom)
+    } else {
+        let (r, c) = buf.cursor;
+        Position::new(x_of(&buf.lines[r].text, c), r.saturating_sub(top) as u16)
+    };
+    frame.set_cursor_position(cursor);
+}
+
+pub fn list(frame: &mut Frame, buf: &Buffer) {
+    let area = frame.area();
+    let height = area.height.saturating_sub(1);
     let tilde = Style::new().fg(Color::Blue);
-    let rows: Vec<Line> = (top..top + height)
+    let rows: Vec<Line> = (buf.top..buf.top + height as usize)
         .map(|i| match buf.lines.get(i) {
             Some(l) => Line::raw(l.text.as_str()),
             None => Line::styled("~", tilde),
         })
         .collect();
     frame.render_widget(Paragraph::new(rows), area);
-
-    let bottom = area.height.saturating_sub(1);
-    let status = match (&buf.mode, &buf.message) {
-        (Mode::Command, _) => format!(":{}", buf.cmdline),
-        (_, Some(msg)) => msg.clone(),
-        (Mode::Insert, _) => "-- INSERT --".into(),
-        (Mode::Normal, _) => String::new(),
-    };
-    let modified = if buf.modified() { "[+]" } else { "" };
-    let status_area = ratatui::layout::Rect { y: bottom, height: 1, ..area };
-    frame.render_widget(Paragraph::new(status.as_str()), status_area);
-    frame.render_widget(Paragraph::new(modified).right_aligned(), status_area);
-
-    let cursor = if buf.mode == Mode::Command {
-        Position::new(1 + buf.cmdline.chars().count() as u16, bottom)
-    } else {
-        let (row, col) = buf.cursor;
-        let text = &buf.lines[row].text;
-        let x = unicode_width::UnicodeWidthStr::width(text.chars().take(col).collect::<String>().as_str());
-        Position::new(x as u16, (row - top) as u16)
-    };
-    frame.set_cursor_position(cursor);
+    highlight(frame, buf, buf.top, height);
+    chrome(frame, buf, buf.top, true);
 }
 
 fn color(c: vt100::Color) -> Color {
@@ -60,16 +93,25 @@ fn color(c: vt100::Color) -> Color {
     }
 }
 
-/// Copies a terminal's screen into the frame. `tag` is drawn bottom-right (e.g. NORMAL).
-pub fn term(frame: &mut Frame, screen: &vt100::Screen, tag: Option<&str>) {
+/// Copies a terminal's screen (at its current scrollback offset) into the frame.
+/// With `normal`, that buffer's cursor, selection, and command line are drawn over it (view n).
+pub fn term(frame: &mut Frame, screen: &vt100::Screen, normal: Option<&Buffer>) {
     let area = frame.area();
-    let buf = frame.buffer_mut();
+    // like vim, scroll a line when the bottom row would cover the cursor
+    let shift = normal.map_or(0, |b| {
+        let covered = !status(b).is_empty() && b.cursor.0 + 1 >= b.top + area.height as usize;
+        u16::from(covered)
+    });
+    let out = frame.buffer_mut();
     for y in 0..area.height {
         for x in 0..area.width {
-            let Some(cell) = screen.cell(y, x) else { continue };
-            let out = &mut buf[(x, y)];
+            let o = &mut out[(x, y)];
+            let Some(cell) = screen.cell(y + shift, x) else {
+                o.reset();
+                continue;
+            };
             if cell.is_wide_continuation() {
-                out.reset();
+                o.reset();
                 continue;
             }
             let mut m = Modifier::empty();
@@ -79,18 +121,21 @@ pub fn term(frame: &mut Frame, screen: &vt100::Screen, tag: Option<&str>) {
             m.set(Modifier::UNDERLINED, cell.underline());
             m.set(Modifier::REVERSED, cell.inverse());
             let symbol = if cell.has_contents() { cell.contents() } else { " " };
-            out.set_symbol(symbol)
+            o.set_symbol(symbol)
                 .set_style(Style::new().fg(color(cell.fgcolor())).bg(color(cell.bgcolor())).add_modifier(m));
         }
     }
-    if let Some(tag) = tag {
-        let w = tag.chars().count() as u16;
-        let at = ratatui::layout::Rect { x: area.width.saturating_sub(w), y: area.height.saturating_sub(1), width: w.min(area.width), height: 1 };
-        frame.render_widget(Paragraph::new(tag).style(Style::new().add_modifier(Modifier::REVERSED)), at);
-    }
-    if !screen.hide_cursor() {
-        let (row, col) = screen.cursor_position();
-        frame.set_cursor_position(Position::new(col, row));
+    match normal {
+        Some(buf) => {
+            let top = buf.top + shift as usize;
+            highlight(frame, buf, top, area.height);
+            chrome(frame, buf, top, false);
+        }
+        None if !screen.hide_cursor() => {
+            let (row, col) = screen.cursor_position();
+            frame.set_cursor_position(Position::new(col, row));
+        }
+        None => {}
     }
 }
 
@@ -99,10 +144,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn scroll_keeps_row_visible() {
-        assert_eq!(scroll(0, 3, 10), 0);
-        assert_eq!(scroll(0, 10, 10), 1);
-        assert_eq!(scroll(5, 2, 10), 2);
-        assert_eq!(scroll(5, 14, 10), 5);
+    fn x_counts_wide_chars() {
+        assert_eq!(x_of("ab", 1), 1);
+        assert_eq!(x_of("日本x", 2), 4);
+        assert_eq!(x_of("ab", 9), 2);
     }
 }
