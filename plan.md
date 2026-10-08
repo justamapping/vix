@@ -42,8 +42,9 @@ rmk: we can also open it under a configuration of these names/terminals, i.e. vi
 
 ### ids
 
-Each line gets a hidden id when the buffer loads: its line position. The id travels with the line through edits
-(yank/paste copies it). After `:w` ids are renumbered. Good enough to start; revisit if it breaks.
+Each line carries a hidden id: the terminal's stable id (a counter, never reused). The id travels with the line
+through edits (yank/paste copies it). Stable rather than line position, so nothing renumbers after `:w` and a
+terminal exiting while the list has unsaved edits doesn't shift everyone else's id.
 
 ### `:w` rules
 
@@ -129,13 +130,16 @@ Status line is one row: `3/7 buzz  NORMAL [+]`. ptys are sized to `rows - 1`.
 vix runs inside the user's terminal (ghostty, kitty, ...), like tmux. It still needs a vt parser per pty
 (tmux has its own in grid.c/screen.c): switching back to a terminal, view n text, `/` search, and list previews all
 need to know what's on screen, which only exists as a stream of escape sequences. We use a crate for this, we don't
-write one. Raw passthrough + SIGWINCH redraw (the dtach trick) works without it, but only for TUIs that redraw
-themselves; a plain shell comes back blank.
+write one. Like tmux, programs never write to the outer terminal directly: pty output feeds `vt100`, and ratatui
+draws from it. vix answers the common queries itself (DA1, DSR/cursor position) and forwards input modes (mouse,
+bracketed paste, app cursor) and cursor shape for the terminal you're typing into.
 
 ## milestones
 
 1. **spike**: one pty, raw passthrough, `<C-\>` drops to a placeholder screen and back. Proves input handling,
-   the riskiest part. No vt yet; returning uses the SIGWINCH redraw trick.
+   the riskiest part. No vt yet: if the program is on the main screen (shell), the placeholder borrows the outer
+   terminal's alt screen so leaving restores it; if it's on the alt screen (nvim), returning uses the SIGWINCH
+   redraw trick. Output while suspended is held and replayed.
 2. **state machine + list**: `state`, `keymap`, `listdiff` with tests. Multiple terminals, `j k gg G <CR> o dd yy p
    cw i <Esc> :w u`, redraw from emulator on switch.
 3. **view n**: scrollback as text buffer, motions, `J/K`, `<C-^>`, `/`, yank to clipboard (OSC 52).
