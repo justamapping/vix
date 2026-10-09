@@ -85,6 +85,7 @@ pub enum Action {
     Parent,
     Switch { back: bool },
     Alternate,
+    Pick,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -163,6 +164,7 @@ pub fn parse(keys: &[Key]) -> Parsed {
         Key::Char('J') => done(Action::Switch { back: false }),
         Key::Char('K') => done(Action::Switch { back: true }),
         Key::Ctrl('^') => done(Action::Alternate),
+        Key::Ctrl('p') => done(Action::Pick),
         Key::Ctrl('e') => done(Action::Scroll(Scroll::LineDown)),
         Key::Ctrl('y') => done(Action::Scroll(Scroll::LineUp)),
         Key::Ctrl('d') => done(Action::Scroll(Scroll::HalfDown)),
@@ -285,6 +287,7 @@ mod tests {
         assert_eq!(p("Z"), Parsed::Invalid);
         assert_eq!(p("3J"), done(Some(3), Action::Switch { back: false }));
         assert_eq!(parse(&[Key::Ctrl('^')]), done(None, Action::Alternate));
+        assert_eq!(parse(&[Key::Ctrl('p')]), done(None, Action::Pick));
     }
 
     #[test]

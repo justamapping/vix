@@ -1,11 +1,12 @@
 use ratatui::Frame;
 use ratatui::layout::{Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::Line;
-use ratatui::widgets::{Clear, Paragraph};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, Clear, Paragraph};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::buffer::{Buffer, Mode};
+use crate::picker::Picker;
 
 /// Screen column of char index `col`.
 fn x_of(text: &str, col: usize) -> u16 {
@@ -171,6 +172,46 @@ pub fn term(frame: &mut Frame, screen: &vt100::Screen, normal: Option<&Buffer>, 
             }
         }
     }
+}
+
+/// Chars of `text` as spans, with the ones `hit` says matched in bold yellow.
+fn marked(text: &str, base: Style, hit: impl Fn(usize) -> bool) -> Vec<Span<'static>> {
+    let on = base.fg(Color::Yellow).add_modifier(Modifier::BOLD);
+    text.chars().enumerate().map(|(i, c)| Span::styled(c.to_string(), if hit(i) { on } else { base })).collect()
+}
+
+/// A centered box over whatever is drawn: the query on top, matches below.
+pub fn picker(frame: &mut Frame, p: &Picker) {
+    let area = frame.area();
+    let width = area.width.saturating_sub(4).min(80);
+    let rows = area.height.saturating_sub(4).min(p.matches.len().max(1) as u16 + 1);
+    let outer = Rect { x: (area.width - width) / 2, y: area.height.saturating_sub(rows + 2) / 2, width, height: (rows + 2).min(area.height) };
+    let block = Block::bordered().title(" terminals ").title_bottom(Line::from(format!(" {}/{} ", p.matches.len(), p.items.len())).right_aligned());
+    let inner = block.inner(outer);
+    frame.render_widget(Clear, outer);
+    frame.render_widget(block, outer);
+
+    let shown = inner.height.saturating_sub(1) as usize;
+    let top = (p.selected + 1).saturating_sub(shown);
+    let name_width = p.items.iter().map(|i| i.name.width()).max().unwrap_or(0);
+    let dim = Style::new().fg(Color::Indexed(245));
+    let mut lines = vec![Line::from(format!("> {}", p.query))];
+    for (row, m) in p.matches.iter().enumerate().skip(top).take(shown) {
+        let item = &p.items[m.item];
+        let selected = row == p.selected;
+        let base = if selected { Style::new().bg(Color::Indexed(238)) } else { Style::new() };
+        let mut spans = vec![Span::styled(format!("{} {:>2}  ", if selected { ">" } else { " " }, item.index), base.patch(dim))];
+        spans.extend(marked(&item.name, base, |i| m.in_name(i)));
+        spans.push(Span::styled(" ".repeat(name_width - item.name.width() + 2), base));
+        spans.extend(marked(&item.cwd, base.patch(dim), |i| m.in_cwd(item, i)));
+        let mut line = Line::from(spans);
+        if selected {
+            line = line.style(base);
+        }
+        lines.push(line);
+    }
+    frame.render_widget(Paragraph::new(lines), inner);
+    frame.set_cursor_position(Position::new(inner.x + 2 + p.query.width() as u16, inner.y));
 }
 
 #[cfg(test)]

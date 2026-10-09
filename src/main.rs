@@ -8,6 +8,7 @@ mod keyspec;
 mod listdiff;
 mod log;
 mod motion;
+mod picker;
 mod proc;
 mod pty;
 mod remap;

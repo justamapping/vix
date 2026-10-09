@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::io::{self, ErrorKind, Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::Sender;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -14,6 +14,7 @@ use crate::dump;
 use crate::input::{self, Input, Key, Mouse, MouseKind};
 use crate::listdiff::{self, Op};
 use crate::motion::Pos;
+use crate::picker::{Item, Pick, Picker};
 use crate::proc;
 use crate::pty::Pty;
 use crate::render::{self, Bar};
@@ -77,6 +78,8 @@ pub struct App {
     alt: Option<u64>,
     /// list row to open once the user answers the write prompt
     confirm: Option<usize>,
+    /// `<C-p>`'s fuzzy finder, drawn over the terminal it has selected
+    picker: Option<Picker>,
     config: Config,
     /// when a partly typed mapping gives up waiting
     pub deadline: Option<Instant>,
@@ -130,6 +133,7 @@ impl App {
             last: None,
             alt: None,
             confirm: None,
+            picker: None,
             config,
             deadline: None,
             quit: false,
@@ -255,6 +259,9 @@ impl App {
     fn remove(&mut self, id: u64) -> Option<Term> {
         let i = self.terms.iter().position(|t| t.id == id)?;
         let t = self.terms.remove(i);
+        if let Some(p) = &mut self.picker {
+            p.remove(id);
+        }
         if self.viewing() == Some(id) {
             self.go_list(id);
         }
@@ -336,6 +343,7 @@ impl App {
                     self.input(input)?;
                 }
                 let waiting = match self.view {
+                    _ if self.picker.is_some() => false,
                     View::List => self.list.waiting(),
                     View::Normal(_) => self.normal.waiting(),
                     View::Insert(_) => false,
@@ -363,6 +371,9 @@ impl App {
     }
 
     fn input(&mut self, input: Input) -> Result<()> {
+        if self.picker.is_some() {
+            return self.picker_input(input);
+        }
         let bytes = match (self.view, input) {
             (_, Input::Mouse(m)) => return self.mouse(m),
             (View::Insert(id), input) => {
@@ -405,6 +416,45 @@ impl App {
                 }
                 break;
             }
+        }
+        Ok(())
+    }
+
+    /// Opens the picker, the alternate terminal first so `<C-p><CR>` acts like `<C-^>`.
+    fn pick(&mut self) {
+        let alternate = if self.viewing().is_some() { self.alt } else { self.last };
+        let mut items: Vec<Item> = self
+            .terms
+            .iter()
+            .enumerate()
+            .map(|(i, t)| Item { id: t.id, index: i + 1, name: t.name.clone(), cwd: tilde(&t.cwd()) })
+            .collect();
+        if let Some(i) = items.iter().position(|item| Some(item.id) == alternate) {
+            let item = items.remove(i);
+            items.insert(0, item);
+        }
+        self.picker = Some(Picker::new(items));
+    }
+
+    fn picker_input(&mut self, input: Input) -> Result<()> {
+        let bytes = match input {
+            Input::Bytes(b) => b,
+            Input::Escape => {
+                self.picker = None;
+                return Ok(());
+            }
+            Input::Mouse(_) => return Ok(()),
+        };
+        for (key, end) in input::spans(&bytes) {
+            let Some(pick) = self.picker.as_mut().and_then(|p| p.key(key)) else { continue };
+            self.picker = None;
+            if let Pick::Open(id) = pick {
+                self.enter_normal(id);
+            }
+            if end < bytes.len() {
+                self.input(Input::Bytes(bytes[end..].to_vec()))?;
+            }
+            break;
         }
         Ok(())
     }
@@ -456,10 +506,55 @@ impl App {
                     Some(i) => self.enter_normal(self.terms[i].id),
                     None => self.normal.message = Some(format!("no terminal {n}")),
                 },
+                Effect::Pick => self.pick(),
+                Effect::Delete(name) => self.delete(id, name),
+                Effect::Rename(name) => self.rename(id, name),
                 Effect::Open(_) | Effect::Write => {}
             }
         }
         Ok(())
+    }
+
+    /// `:d [name]` from view n on `id`. Deleting the viewed terminal moves on to the alternate or a neighbor, like `:bd`.
+    fn delete(&mut self, id: u64, name: Option<String>) {
+        let target = match &name {
+            None => id,
+            Some(name) => match self.terms.iter().find(|t| &t.name == name) {
+                Some(t) => t.id,
+                None => {
+                    self.normal.message = Some(format!("E94: No matching terminal for {name}"));
+                    return;
+                }
+            },
+        };
+        let next = if target == id { self.successor(id) } else { Some(id) };
+        let Some(mut t) = self.remove(target) else { return };
+        t.pty.kill();
+        let msg = format!("{} killed", t.name);
+        match next {
+            Some(next) if next != id => {
+                self.enter_normal(next);
+                self.normal.message = Some(msg);
+            }
+            Some(_) => self.normal.message = Some(msg),
+            None => self.list.message = Some(msg),
+        }
+    }
+
+    /// Where view n goes when `id` is deleted: the alternate, else the next terminal, else the previous.
+    fn successor(&self, id: u64) -> Option<u64> {
+        if let Some(alt) = self.alt.filter(|a| *a != id && self.alive(*a)) {
+            return Some(alt);
+        }
+        let i = self.terms.iter().position(|t| t.id == id)?;
+        self.terms.get(i + 1).or(i.checked_sub(1).and_then(|j| self.terms.get(j))).map(|t| t.id)
+    }
+
+    /// `:r name` from view n on `id`.
+    fn rename(&mut self, id: u64, name: String) {
+        let Some(t) = self.term(id) else { return };
+        let old = std::mem::replace(&mut t.name, name.clone());
+        self.list.rename_id(id, &old, &name);
     }
 
     /// The program in view i asked for the mouse, so events go to it as they are.
@@ -580,6 +675,7 @@ impl App {
                 Effect::QuitAll { force } => self.quit_all(force, false),
                 Effect::Reload => self.list.load(self.lines()),
                 Effect::Edit { name, new } => self.edit(name, new, None),
+                Effect::Pick => self.pick(),
                 _ => {}
             }
         }
@@ -719,6 +815,21 @@ impl App {
         }
         self.refresh_normal();
         let bar = self.bar();
+        if let Some(p) = &self.picker {
+            // typing keeps what you were looking at; moving the selection previews it
+            let shown = if p.browsing { p.selection() } else { self.viewing() };
+            let preview = shown.and_then(|id| self.terms.iter().find(|t| t.id == id));
+            terminal.draw(|f| {
+                match (preview, &bar) {
+                    (Some(t), bar) => render::term(f, t.vt.screen(), None, bar.as_ref()),
+                    (None, Some(bar)) if self.view == View::List => render::list(f, &self.list, bar),
+                    _ => {}
+                }
+                render::picker(f, p);
+            })?;
+            let modes = self.mouse_modes(Modes { cursor_shape: 6, ..Default::default() });
+            return self.set_outer(modes);
+        }
         let modes = match self.view {
             View::List => {
                 let insert = self.list.mode == buffer::Mode::Insert;
@@ -745,6 +856,10 @@ impl App {
                 if modes.mouse == 0 { self.mouse_modes(modes) } else { modes }
             }
         };
+        self.set_outer(modes)
+    }
+
+    fn set_outer(&mut self, modes: Modes) -> Result<()> {
         if self.outer != Some(modes) {
             let mut out = io::stdout();
             out.write_all(&vt::mode_bytes(modes))?;
@@ -752,6 +867,16 @@ impl App {
             self.outer = Some(modes);
         }
         Ok(())
+    }
+}
+
+/// `path` with the home directory as `~`.
+fn tilde(path: &Path) -> String {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    match home.as_deref().and_then(|h| path.strip_prefix(h).ok()) {
+        Some(rest) if rest.as_os_str().is_empty() => "~".into(),
+        Some(rest) => format!("~/{}", rest.display()),
+        None => path.display().to_string(),
     }
 }
 

@@ -44,6 +44,12 @@ pub enum Effect {
     Switch(isize),
     Alternate,
     Goto(usize),
+    /// `<C-p>` opens the terminal picker
+    Pick,
+    /// view n's `:d [name]` kills the named terminal, else the one in view
+    Delete(Option<String>),
+    /// view n's `:r name` renames the terminal in view
+    Rename(String),
     /// `:e name` views the terminal called `name`, spawning it if there is none; `:new name` always spawns
     Edit { name: String, new: bool },
 }
@@ -170,6 +176,15 @@ impl Buffer {
     pub fn push_saved(&mut self, line: Line) {
         self.saved.push(line.clone());
         self.lines.push(line);
+    }
+
+    /// Renames a terminal's saved line, and its unsaved one unless that was edited.
+    pub fn rename_id(&mut self, id: u64, from: &str, to: &str) {
+        for l in self.lines.iter_mut().chain(self.saved.iter_mut()) {
+            if l.id == Some(id) && l.text == from {
+                l.text = to.into();
+            }
+        }
     }
 
     pub fn modified(&self) -> bool {
@@ -380,6 +395,7 @@ impl Buffer {
             Action::Parent => return vec![Effect::Parent],
             Action::Switch { back } => return vec![Effect::Switch(if back { -(n as isize) } else { n as isize })],
             Action::Alternate => return vec![Effect::Alternate],
+            Action::Pick => return vec![Effect::Pick],
         }
         vec![]
     }
@@ -712,6 +728,16 @@ impl Buffer {
         if let Some(effect) = edit(cmd) {
             return vec![effect];
         }
+        let (word, arg) = split(cmd);
+        match (word, arg) {
+            ("d" | "delete", _) if self.readonly => return vec![Effect::Delete((!arg.is_empty()).then(|| arg.into()))],
+            ("r" | "rename", "") if self.readonly => {
+                self.message = Some("E471: Argument required".into());
+                return vec![];
+            }
+            ("r" | "rename", _) if self.readonly => return vec![Effect::Rename(arg.into())],
+            _ => {}
+        }
         match cmd {
             "w" | "w!" if self.readonly => {
                 self.message = Some("E45: 'readonly' option is set".into());
@@ -744,7 +770,7 @@ impl Buffer {
 
 /// `:e name`, `:n name`, `:new name`; a bare `:n` spawns "Untitled".
 fn edit(cmd: &str) -> Option<Effect> {
-    let (word, name) = cmd.split_once(char::is_whitespace).map_or((cmd, ""), |(w, n)| (w, n.trim()));
+    let (word, name) = split(cmd);
     let new = match word {
         "e" | "edit" if !name.is_empty() => false,
         "n" | "new" => true,
@@ -752,6 +778,11 @@ fn edit(cmd: &str) -> Option<Effect> {
     };
     let name = if name.is_empty() { "Untitled" } else { name };
     Some(Effect::Edit { name: name.into(), new })
+}
+
+/// An ex command's name and its trimmed argument.
+fn split(cmd: &str) -> (&str, &str) {
+    cmd.split_once(char::is_whitespace).map_or((cmd, ""), |(w, a)| (w, a.trim()))
 }
 
 #[cfg(test)]
@@ -918,6 +949,32 @@ mod tests {
         assert_eq!(feed(&mut b, "\x1e"), vec![Effect::Alternate]);
         assert_eq!(feed(&mut b, "yy"), vec![Effect::Yank("$ ls\n".into())]);
         assert_eq!(feed(&mut b, ":x\r"), vec![Effect::Quit { force: false }]);
+    }
+
+    #[test]
+    fn readonly_delete_and_rename() {
+        let mut b = view(&["$ ls"]);
+        assert_eq!(feed(&mut b, ":d\r"), vec![Effect::Delete(None)]);
+        assert_eq!(feed(&mut b, ":delete web server \r"), vec![Effect::Delete(Some("web server".into()))]);
+        assert_eq!(feed(&mut b, ":r api\r"), vec![Effect::Rename("api".into())]);
+        assert_eq!(feed(&mut b, ":r \r"), vec![]);
+        assert!(b.message.as_deref().unwrap().starts_with("E471"));
+        // the list keeps vim's meaning
+        let mut list = buf(&["foo"]);
+        feed(&mut list, ":d\r");
+        assert!(list.message.as_deref().unwrap().starts_with("E492"));
+    }
+
+    #[test]
+    fn rename_id_keeps_unsaved_edits() {
+        let mut b = buf(&["foo", "bar"]);
+        b.rename_id(0, "foo", "web");
+        assert_eq!(ids(&b), vec![(Some(0), "web"), (Some(1), "bar")]);
+        assert!(!b.modified());
+        feed(&mut b, "jcwbaz\x1b");
+        b.rename_id(1, "bar", "api");
+        assert_eq!(ids(&b), vec![(Some(0), "web"), (Some(1), "baz")]);
+        assert_eq!(b.saved[1].text, "api");
     }
 
     #[test]
