@@ -10,6 +10,7 @@ use ratatui::DefaultTerminal;
 
 use crate::buffer::{self, Buffer, Effect, Line};
 use crate::config::Config;
+use crate::dump;
 use crate::input::{self, Input, Key, Mouse, MouseKind};
 use crate::listdiff::{self, Op};
 use crate::motion::Pos;
@@ -136,11 +137,12 @@ impl App {
         app.size_buffers();
         let mut saved = session.terms;
         if saved.is_empty() {
-            saved.push(Saved { name: "Untitled".into(), cwd: cwd.clone() });
+            saved.push(Saved { name: "Untitled".into(), cwd: cwd.clone(), output: Vec::new() });
         }
-        for Saved { name, cwd: dir } in saved {
+        for Saved { name, cwd: dir, output } in saved {
             let dir = if dir.is_dir() { dir } else { cwd.clone() };
-            let t = app.spawn(name, dir)?;
+            let mut t = app.spawn(name, dir)?;
+            dump::restore(&mut t.vt, &output);
             app.terms.push(t);
         }
         app.list.load(app.lines());
@@ -149,8 +151,8 @@ impl App {
     }
 
     /// The list as `--resume` will bring it back.
-    pub fn snapshot(&self) -> Session {
-        let terms = self.terms.iter().map(|t| Saved { name: t.name.clone(), cwd: t.cwd() }).collect();
+    pub fn snapshot(&mut self) -> Session {
+        let terms = self.terms.iter_mut().map(|t| Saved { name: t.name.clone(), cwd: t.cwd(), output: dump::dump(&mut t.vt) }).collect();
         let at = self.viewing().or(self.last).and_then(|id| self.terms.iter().position(|t| t.id == id));
         Session { cursor: at.unwrap_or(self.list.cursor.0), terms }
     }

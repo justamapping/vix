@@ -1,6 +1,7 @@
 mod app;
 mod buffer;
 mod config;
+mod dump;
 mod input;
 mod keymap;
 mod keyspec;
