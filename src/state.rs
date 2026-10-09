@@ -18,9 +18,25 @@ pub fn step(view: View, input: Input, esc: u8) -> (View, Vec<u8>) {
     }
 }
 
+/// Chrome's cmd+1-9: index of the nth terminal, with 9 always the last.
+pub fn goto(n: usize, len: usize) -> Option<usize> {
+    let i = if n == 9 { len.checked_sub(1)? } else { n.checked_sub(1)? };
+    (i < len).then_some(i)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn goto_is_chrome_like() {
+        assert_eq!(goto(1, 3), Some(0));
+        assert_eq!(goto(3, 3), Some(2));
+        assert_eq!(goto(4, 3), None);
+        assert_eq!(goto(9, 3), Some(2));
+        assert_eq!(goto(9, 12), Some(11));
+        assert_eq!(goto(9, 0), None);
+    }
 
     fn bytes(b: &[u8]) -> Input {
         Input::Bytes(b.to_vec())

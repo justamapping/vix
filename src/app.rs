@@ -110,6 +110,7 @@ impl App {
         normal.maps = config.view.clone();
         let mut list = Buffer::new(Vec::new());
         list.maps = config.list.clone();
+        list.insert_maps = config.list_insert.clone();
         let mut app = Self {
             terms: Vec::new(),
             list,
@@ -448,6 +449,11 @@ impl App {
                     self.stale = true;
                     self.refresh_normal();
                 }
+                Effect::Edit { name, new } => self.edit(name, new, Some(id)),
+                Effect::Goto(n) => match state::goto(n, self.terms.len()) {
+                    Some(i) => self.enter_normal(self.terms[i].id),
+                    None => self.normal.message = Some(format!("no terminal {n}")),
+                },
                 Effect::Open(_) | Effect::Write => {}
             }
         }
@@ -571,10 +577,37 @@ impl App {
                 Effect::Quit { .. } => self.quit = true,
                 Effect::QuitAll { force } => self.quit_all(force, false),
                 Effect::Reload => self.list.load(self.lines()),
+                Effect::Edit { name, new } => self.edit(name, new, None),
                 _ => {}
             }
         }
         Ok(())
+    }
+
+    /// `:e name` / `:new name`: views the terminal called `name`, or spawns it at the end of the list in `from`'s directory.
+    fn edit(&mut self, name: String, new: bool, from: Option<u64>) {
+        if let Some(id) = self.terms.iter().find(|t| !new && t.name == name).map(|t| t.id) {
+            self.set_view(View::Insert(id));
+            return;
+        }
+        let cwd = self.terms.iter().find(|t| Some(t.id) == from).map_or(self.cwd.clone(), Term::cwd);
+        match self.spawn(name, cwd) {
+            Ok(t) => {
+                let line = Line { id: Some(t.id), text: t.name.clone() };
+                let id = t.id;
+                self.terms.push(t);
+                if self.list.modified() {
+                    self.list.push_saved(line);
+                } else {
+                    self.list.load(self.lines());
+                }
+                self.set_view(View::Insert(id));
+            }
+            Err(e) => {
+                let buf = if from.is_some() { &mut self.normal } else { &mut self.list };
+                buf.message = Some(format!("spawn failed: {e}"));
+            }
+        }
     }
 
     fn open(&mut self, id: Option<u64>) {

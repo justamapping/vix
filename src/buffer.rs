@@ -38,11 +38,14 @@ pub enum Effect {
     QuitAll { force: bool },
     Reload,
     Yank(String),
-    /// keys a read-only buffer passes up: `i a I A`, `-`, `J`/`K` with count, `<C-^>`
+    /// keys a read-only buffer passes up: `i a I A`, `-`, `J`/`K`, `<C-^>`, and `1`-`9` as `Goto`
     Insert,
     Parent,
     Switch(isize),
     Alternate,
+    Goto(usize),
+    /// `:e name` views the terminal called `name`, spawning it if there is none; `:new name` always spawns
+    Edit { name: String, new: bool },
 }
 
 #[derive(Debug, Clone)]
@@ -70,6 +73,7 @@ pub struct Buffer {
     pub height: usize,
     /// normal and visual mode mappings
     pub maps: Vec<Map>,
+    pub insert_maps: Vec<Map>,
     typeahead: Vec<Key>,
     anchor: Pos,
     saved: Vec<Line>,
@@ -113,6 +117,7 @@ impl Buffer {
             top: 0,
             height: 1,
             maps: Vec::new(),
+            insert_maps: Vec::new(),
             typeahead: Vec::new(),
             anchor: (0, 0),
             saved: Vec::new(),
@@ -161,6 +166,12 @@ impl Buffer {
         self.clamp();
     }
 
+    /// Adds a line that is already saved, keeping any unsaved edits.
+    pub fn push_saved(&mut self, line: Line) {
+        self.saved.push(line.clone());
+        self.lines.push(line);
+    }
+
     pub fn modified(&self) -> bool {
         self.lines != self.saved
     }
@@ -177,12 +188,12 @@ impl Buffer {
     }
 
     pub fn key(&mut self, key: Key) -> Vec<Effect> {
-        let mappable = matches!(self.mode, Mode::Normal | Mode::Visual { .. }) && !keymap::awaits_char(&self.pending);
-        if self.maps.is_empty() || !mappable {
+        let maps = self.active_maps();
+        if maps.is_empty() {
             return self.press(key);
         }
         self.typeahead.push(key);
-        let (keys, wait) = remap::resolve(&self.maps, &self.typeahead, false);
+        let (keys, wait) = remap::resolve(self.active_maps(), &self.typeahead, false);
         self.typeahead = wait;
         keys.into_iter().flat_map(|k| self.press(k)).collect()
     }
@@ -214,6 +225,15 @@ impl Buffer {
         self.clamp();
     }
 
+    /// Mappings for the current mode; f/t targets and the command line aren't mapped.
+    fn active_maps(&self) -> &[Map] {
+        match self.mode {
+            Mode::Normal | Mode::Visual { .. } if !keymap::awaits_char(&self.pending) => &self.maps,
+            Mode::Insert => &self.insert_maps,
+            _ => &[],
+        }
+    }
+
     /// A mapping is waiting on more keys.
     pub fn waiting(&self) -> bool {
         !self.typeahead.is_empty()
@@ -222,7 +242,7 @@ impl Buffer {
     /// Stops waiting after the timeout and runs what was typed.
     pub fn flush(&mut self) -> Vec<Effect> {
         let typed = std::mem::take(&mut self.typeahead);
-        let (keys, _) = remap::resolve(&self.maps, &typed, true);
+        let (keys, _) = remap::resolve(self.active_maps(), &typed, true);
         keys.into_iter().flat_map(|k| self.press(k)).collect()
     }
 
@@ -247,6 +267,10 @@ impl Buffer {
         if key == Key::Esc {
             self.pending.clear();
             return vec![];
+        }
+        // view n trades leading counts for one-key terminal switching, like Chrome's cmd+1-9
+        if let (true, true, Key::Char(c @ '1'..='9')) = (self.readonly, self.pending.is_empty(), key) {
+            return vec![Effect::Goto(c as usize - '0' as usize)];
         }
         self.pending.push(key);
         match keymap::parse(&self.pending) {
@@ -685,6 +709,9 @@ impl Buffer {
             self.cursor.1 = motion::first_non_blank(&self.lines[self.cursor.0].text);
             return vec![];
         }
+        if let Some(effect) = edit(cmd) {
+            return vec![effect];
+        }
         match cmd {
             "w" | "w!" if self.readonly => {
                 self.message = Some("E45: 'readonly' option is set".into());
@@ -702,6 +729,10 @@ impl Buffer {
             "qa" | "qall" => vec![Effect::QuitAll { force: false }],
             "qa!" | "qall!" => vec![Effect::QuitAll { force: true }],
             "e!" => vec![Effect::Reload],
+            "e" | "edit" => {
+                self.message = Some("E32: No file name".into());
+                vec![]
+            }
             "" => vec![],
             other => {
                 self.message = Some(format!("E492: Not an editor command: {other}"));
@@ -709,6 +740,18 @@ impl Buffer {
             }
         }
     }
+}
+
+/// `:e name`, `:n name`, `:new name`; a bare `:n` spawns "Untitled".
+fn edit(cmd: &str) -> Option<Effect> {
+    let (word, name) = cmd.split_once(char::is_whitespace).map_or((cmd, ""), |(w, n)| (w, n.trim()));
+    let new = match word {
+        "e" | "edit" if !name.is_empty() => false,
+        "n" | "new" => true,
+        _ => return None,
+    };
+    let name = if name.is_empty() { "Untitled" } else { name };
+    Some(Effect::Edit { name: name.into(), new })
 }
 
 #[cfg(test)]
@@ -814,6 +857,11 @@ mod tests {
         assert!(b.message.as_deref().unwrap().starts_with("E37"));
         assert_eq!(feed(&mut b, ":q!\r"), vec![Effect::Quit { force: true }]);
         assert_eq!(feed(&mut b, ":qa!\r"), vec![Effect::QuitAll { force: true }]);
+        let edit = |name: &str, new| vec![Effect::Edit { name: name.into(), new }];
+        assert_eq!(feed(&mut b, ":e web server\r"), edit("web server", false));
+        assert_eq!(feed(&mut b, ":n api\r"), edit("api", true));
+        assert_eq!(feed(&mut b, ":new\r"), edit("Untitled", true));
+        assert_eq!(feed(&mut b, ":e\r"), vec![]);
         feed(&mut b, ":nope\r");
         assert!(b.message.as_deref().unwrap().starts_with("E492"));
     }
@@ -860,7 +908,13 @@ mod tests {
         assert!(b.message.as_deref().unwrap().starts_with("E21"));
         assert_eq!(feed(&mut b, "a"), vec![Effect::Insert]);
         assert_eq!(feed(&mut b, "-"), vec![Effect::Parent]);
-        assert_eq!(feed(&mut b, "3K"), vec![Effect::Switch(-3)]);
+        assert_eq!(feed(&mut b, "K"), vec![Effect::Switch(-1)]);
+        assert_eq!(feed(&mut b, "3"), vec![Effect::Goto(3)]);
+        assert_eq!(feed(&mut b, "9"), vec![Effect::Goto(9)]);
+        // counts after an operator and 0 still work
+        assert_eq!(feed(&mut b, "y2j"), vec![Effect::Yank("$ ls\na b\n".into())]);
+        feed(&mut b, "$0");
+        assert_eq!(b.cursor.1, 0);
         assert_eq!(feed(&mut b, "\x1e"), vec![Effect::Alternate]);
         assert_eq!(feed(&mut b, "yy"), vec![Effect::Yank("$ ls\n".into())]);
         assert_eq!(feed(&mut b, ":x\r"), vec![Effect::Quit { force: false }]);
@@ -978,5 +1032,18 @@ mod tests {
         // the command line isn't mapped
         assert_eq!(feed(&mut b, ":qj"), vec![]);
         assert_eq!(b.cmdline, "qj");
+        // insert mode has its own mappings
+        let mut b = buf(&["a"]);
+        b.insert_maps = vec![map("jk", "<Esc>")];
+        feed(&mut b, "Abjk");
+        assert_eq!((b.mode, b.lines[0].text.as_str()), (Mode::Normal, "ab"));
+        feed(&mut b, "Ajx");
+        assert_eq!(b.lines[0].text, "abjx");
+        feed(&mut b, "j");
+        assert!(b.waiting());
+        b.flush();
+        assert_eq!((b.mode, b.lines[0].text.as_str()), (Mode::Insert, "abjxj"));
+        feed(&mut b, "\x1b:jk\r");
+        assert!(b.message.as_deref().unwrap().starts_with("E492"));
     }
 }

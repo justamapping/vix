@@ -17,6 +17,7 @@ pub struct Config {
     /// how long a partly typed mapping waits, like vim's 'timeoutlen'
     pub timeout: Duration,
     pub list: Vec<Map>,
+    pub list_insert: Vec<Map>,
     pub view: Vec<Map>,
     pub status: Status,
     /// vix takes the mouse for scrolling and selecting, unless the program in view asked for it
@@ -43,6 +44,7 @@ impl Default for Config {
             escape: CTRL_BACKSLASH,
             timeout: Duration::from_millis(1000),
             list: Vec::new(),
+            list_insert: Vec::new(),
             view: default_view(),
             status: Status::default(),
             mouse: true,
@@ -83,6 +85,7 @@ struct StatusFile {
 #[serde(default, deny_unknown_fields)]
 struct Maps {
     list: BTreeMap<String, String>,
+    list_insert: BTreeMap<String, String>,
     view: BTreeMap<String, String>,
 }
 
@@ -106,6 +109,7 @@ pub fn parse(text: &str) -> Result<Config> {
         config.mouse = mouse;
     }
     config.list = maps(&file.map.list)?;
+    config.list_insert = maps(&file.map.list_insert)?;
     config.view = with_defaults(default_view(), maps(&file.map.view)?);
     let status = &mut config.status;
     if let Some(enabled) = file.status.enabled {
@@ -179,6 +183,9 @@ mod tests {
         assert!(!c.status.enabled);
         assert_eq!(c.status.left, Template::parse("{name}").unwrap());
         assert_eq!(c.status.right, Status::default().right);
+        assert!(c.list_insert.is_empty());
+        let c = parse("[map.list_insert]\njk = \"<Esc>\"").unwrap();
+        assert_eq!(c.list_insert, vec![Map { lhs: vec![Key::Char('j'), Key::Char('k')], rhs: vec![Key::Esc] }]);
     }
 
     #[test]

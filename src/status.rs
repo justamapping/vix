@@ -82,10 +82,10 @@ impl Template {
     }
 }
 
-/// Names with tmux's flags: `*` current, `-` alternate, `#` activity, `!` bell.
+/// Numbered names with tmux's flags: `*` current, `-` alternate, `#` activity, `!` bell.
 fn terms(entries: &[Entry]) -> String {
-    let flagged = entries.iter().map(|t| {
-        let mut s = t.name.to_string();
+    let flagged = entries.iter().enumerate().map(|(i, t)| {
+        let mut s = format!("{}:{}", i + 1, t.name);
         for (on, flag) in [(t.current, '*'), (t.alternate, '-'), (t.activity, '#'), (t.bell, '!')] {
             if on {
                 s.push(flag);
@@ -121,17 +121,17 @@ mod tests {
         let t = |s: &str| Template::parse(s).unwrap().expand(&info());
         assert_eq!(t("{mode}"), "-- TERMINAL --");
         assert_eq!(t("{index}/{total} {name}"), "1/3 web");
-        assert_eq!(t("{terms}"), "web* api- claude#!");
+        assert_eq!(t("{terms}"), "1:web* 2:api- 3:claude#!");
         assert_eq!(t("[{name}]"), "[web]");
     }
 
     #[test]
     fn empty_fields_trim() {
         let list = Info { mode: "", terms: vec![entry("web")], ..Default::default() };
-        assert_eq!(Template::parse("{modified} {terms}").unwrap().expand(&list), "web");
+        assert_eq!(Template::parse("{modified} {terms}").unwrap().expand(&list), "1:web");
         assert_eq!(Template::parse("{index} {name}").unwrap().expand(&list), "");
         let modified = Info { modified: true, ..list };
-        assert_eq!(Template::parse("{modified} {terms}").unwrap().expand(&modified), "[+] web");
+        assert_eq!(Template::parse("{modified} {terms}").unwrap().expand(&modified), "[+] 1:web");
     }
 
     #[test]
