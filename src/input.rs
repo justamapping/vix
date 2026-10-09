@@ -4,6 +4,68 @@ pub const CTRL_BACKSLASH: u8 = 0x1c;
 pub enum Input {
     Bytes(Vec<u8>),
     Escape,
+    Mouse(Mouse),
+}
+
+/// An SGR (`CSI < b;x;y M/m`) mouse event; x and y are 1-based.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Mouse {
+    pub button: u16,
+    pub x: u16,
+    pub y: u16,
+    pub release: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum MouseKind {
+    WheelUp,
+    WheelDown,
+    Press,
+    Drag,
+    Other,
+}
+
+impl Mouse {
+    pub fn kind(&self) -> MouseKind {
+        if self.release {
+            return MouseKind::Other;
+        }
+        // without the shift/meta/ctrl bits
+        match self.button & !0b11100 {
+            64 => MouseKind::WheelUp,
+            65 => MouseKind::WheelDown,
+            0 => MouseKind::Press,
+            32 => MouseKind::Drag,
+            _ => MouseKind::Other,
+        }
+    }
+
+    /// 0-based screen cell.
+    pub fn cell(&self) -> (u16, u16) {
+        (self.x.saturating_sub(1), self.y.saturating_sub(1))
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        format!("\x1b[<{};{};{}{}", self.button, self.x, self.y, if self.release { 'm' } else { 'M' }).into_bytes()
+    }
+}
+
+/// Matches an SGR mouse event at the start of `bytes`. Returns its length.
+fn sgr_mouse(bytes: &[u8]) -> Option<(usize, Mouse)> {
+    let body = bytes.strip_prefix(b"\x1b[<")?;
+    let end = body.iter().position(|b| !(b.is_ascii_digit() || *b == b';'))?;
+    let release = match body[end] {
+        b'M' => false,
+        b'm' => true,
+        _ => return None,
+    };
+    let params = std::str::from_utf8(&body[..end]).ok()?;
+    let mut nums = params.split(';').map(|n| n.parse::<u16>().ok());
+    let (button, x, y) = (nums.next()??, nums.next()??, nums.next()??);
+    if nums.next().is_some() {
+        return None;
+    }
+    Some((3 + end + 1, Mouse { button, x, y, release }))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -20,21 +82,25 @@ pub enum Key {
     Right,
 }
 
-/// Splits a stdin chunk on the escape key's byte, raw or kitty-encoded (`CSI 92;5u` for `<C-\>`).
+/// Splits a stdin chunk on the escape key's byte, raw or kitty-encoded (`CSI 92;5u` for `<C-\>`), and on SGR mouse events.
 pub fn split(bytes: &[u8], esc: u8) -> Vec<Input> {
     let mut out = Vec::new();
     let mut pending = Vec::new();
     let mut i = 0;
     while i < bytes.len() {
-        let hit = if bytes[i] == esc { Some((1, true)) } else { kitty_ctrl(&bytes[i..], esc) };
+        let hit = if bytes[i] == esc {
+            Some((1, Some(Input::Escape)))
+        } else if let Some((len, m)) = sgr_mouse(&bytes[i..]) {
+            Some((len, Some(Input::Mouse(m))))
+        } else {
+            kitty_ctrl(&bytes[i..], esc).map(|(len, press)| (len, press.then_some(Input::Escape)))
+        };
         match hit {
-            Some((len, press)) => {
+            Some((len, input)) => {
                 if !pending.is_empty() {
                     out.push(Input::Bytes(std::mem::take(&mut pending)));
                 }
-                if press {
-                    out.push(Input::Escape);
-                }
+                out.extend(input);
                 i += len;
             }
             None => {
@@ -170,6 +236,21 @@ mod tests {
         assert_eq!(split(b"a\x00b\x1c", 0), vec![bytes(b"a"), Input::Escape, bytes(b"b\x1c")]);
         assert_eq!(split(b"\x1b[32;5u\x1b[97;5u", 0), vec![Input::Escape, bytes(b"\x1b[97;5u")]);
         assert_eq!(split(b"\x1b[97;5u", 1), vec![Input::Escape]);
+    }
+
+    #[test]
+    fn sgr_mouse_events() {
+        let m = |button, x, y, release| Input::Mouse(Mouse { button, x, y, release });
+        assert_eq!(split(b"\x1b[<64;10;5M", CTRL_BACKSLASH), vec![m(64, 10, 5, false)]);
+        assert_eq!(split(b"a\x1b[<0;1;2mb", CTRL_BACKSLASH), vec![bytes(b"a"), m(0, 1, 2, true), bytes(b"b")]);
+        assert_eq!(split(b"\x1b[<0;1M", CTRL_BACKSLASH), vec![bytes(b"\x1b[<0;1M")]);
+        let kind = |button, release| Mouse { button, x: 1, y: 1, release }.kind();
+        assert_eq!(kind(64, false), MouseKind::WheelUp);
+        assert_eq!(kind(65 | 16, false), MouseKind::WheelDown);
+        assert_eq!(kind(32, false), MouseKind::Drag);
+        assert_eq!(kind(0, true), MouseKind::Other);
+        assert_eq!(kind(2, false), MouseKind::Other);
+        assert_eq!(Mouse { button: 65, x: 3, y: 4, release: true }.encode(), b"\x1b[<65;3;4m");
     }
 
     #[test]

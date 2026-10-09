@@ -5,9 +5,10 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
-use crate::input::CTRL_BACKSLASH;
+use crate::input::{CTRL_BACKSLASH, Key};
 use crate::keyspec;
 use crate::remap::Map;
+use crate::status::Template;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Config {
@@ -17,12 +18,47 @@ pub struct Config {
     pub timeout: Duration,
     pub list: Vec<Map>,
     pub view: Vec<Map>,
+    pub status: Status,
+    /// vix takes the mouse for scrolling and selecting, unless the program in view asked for it
+    pub mouse: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Status {
+    pub enabled: bool,
+    pub left: Template,
+    pub right: Template,
+}
+
+impl Default for Status {
+    fn default() -> Self {
+        let t = |s| Template::parse(s).expect("default template parses");
+        Self { enabled: true, left: t("{mode}"), right: t("{modified} {terms}") }
+    }
 }
 
 impl Default for Config {
     fn default() -> Self {
-        Self { escape: CTRL_BACKSLASH, timeout: Duration::from_millis(1000), list: Vec::new(), view: Vec::new() }
+        Self {
+            escape: CTRL_BACKSLASH,
+            timeout: Duration::from_millis(1000),
+            list: Vec::new(),
+            view: default_view(),
+            status: Status::default(),
+            mouse: true,
+        }
     }
+}
+
+/// Built-in view n mappings; a config mapping with the same lhs replaces one.
+fn default_view() -> Vec<Map> {
+    vec![Map { lhs: vec![Key::Char('q')], rhs: vec![Key::Char('-')] }]
+}
+
+fn with_defaults(defaults: Vec<Map>, user: Vec<Map>) -> Vec<Map> {
+    let mut maps: Vec<Map> = defaults.into_iter().filter(|d| !user.iter().any(|u| u.lhs == d.lhs)).collect();
+    maps.extend(user);
+    maps
 }
 
 #[derive(Deserialize, Default)]
@@ -30,7 +66,17 @@ impl Default for Config {
 struct File {
     escape: Option<String>,
     timeoutlen: Option<u64>,
+    mouse: Option<bool>,
     map: Maps,
+    status: StatusFile,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+struct StatusFile {
+    enabled: Option<bool>,
+    left: Option<String>,
+    right: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -56,8 +102,21 @@ pub fn parse(text: &str) -> Result<Config> {
     if let Some(ms) = file.timeoutlen {
         config.timeout = Duration::from_millis(ms);
     }
+    if let Some(mouse) = file.mouse {
+        config.mouse = mouse;
+    }
     config.list = maps(&file.map.list)?;
-    config.view = maps(&file.map.view)?;
+    config.view = with_defaults(default_view(), maps(&file.map.view)?);
+    let status = &mut config.status;
+    if let Some(enabled) = file.status.enabled {
+        status.enabled = enabled;
+    }
+    if let Some(left) = &file.status.left {
+        status.left = Template::parse(left).context("status.left")?;
+    }
+    if let Some(right) = &file.status.right {
+        status.right = Template::parse(right).context("status.right")?;
+    }
     Ok(config)
 }
 
@@ -87,7 +146,6 @@ pub fn load() -> (Config, Option<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::input::Key;
 
     #[test]
     fn empty_is_default() {
@@ -110,7 +168,17 @@ mod tests {
         assert_eq!(c.escape, 0);
         assert_eq!(c.timeout, Duration::from_millis(300));
         assert_eq!(c.list, vec![Map { lhs: vec![Key::Ctrl('j')], rhs: vec![Key::Char('J')] }]);
-        assert_eq!(c.view[0].rhs, vec![Key::Char(':'), Key::Char('q'), Key::Enter]);
+        assert_eq!(c.view, vec![Map { lhs: vec![Key::Char('q')], rhs: vec![Key::Char(':'), Key::Char('q'), Key::Enter] }]);
+    }
+
+    #[test]
+    fn default_q_and_status() {
+        let c = parse("[map.view]\n\"<C-j>\" = \"J\"\n[status]\nenabled = false\nleft = \"{name}\"").unwrap();
+        assert_eq!(c.view[0], default_view()[0]);
+        assert_eq!(c.view.len(), 2);
+        assert!(!c.status.enabled);
+        assert_eq!(c.status.left, Template::parse("{name}").unwrap());
+        assert_eq!(c.status.right, Status::default().right);
     }
 
     #[test]
@@ -119,5 +187,6 @@ mod tests {
         assert!(parse("bogus = 1").is_err());
         assert!(parse("[map.insert]\na = \"b\"").is_err());
         assert!(parse("[map.list]\n\"\" = \"b\"").is_err());
+        assert!(parse("[status]\nleft = \"{nope}\"").is_err());
     }
 }

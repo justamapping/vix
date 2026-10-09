@@ -5,14 +5,19 @@ pub type Parser = vt100::Parser<Callbacks>;
 
 pub const SCROLLBACK: usize = 10_000;
 
-/// Collects what vt100 doesn't handle itself: replies to terminal queries and the cursor shape.
+/// Collects what vt100 doesn't handle itself: replies to terminal queries, the cursor shape, and bells.
 #[derive(Default)]
 pub struct Callbacks {
     pub replies: Vec<u8>,
     pub cursor_shape: u16,
+    pub bell: bool,
 }
 
 impl vt100::Callbacks for Callbacks {
+    fn audible_bell(&mut self, _: &mut vt100::Screen) {
+        self.bell = true;
+    }
+
     fn unhandled_csi(
         &mut self,
         screen: &mut vt100::Screen,

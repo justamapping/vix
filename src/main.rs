@@ -13,6 +13,7 @@ mod remap;
 mod render;
 mod session;
 mod state;
+mod status;
 mod vt;
 
 use std::io::{self, Write};

@@ -3,20 +3,22 @@ use std::io::{self, ErrorKind, Read, Write};
 use std::path::PathBuf;
 use std::sync::mpsc::Sender;
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use ratatui::DefaultTerminal;
 
 use crate::buffer::{self, Buffer, Effect, Line};
 use crate::config::Config;
-use crate::input::{self, Input, Key};
+use crate::input::{self, Input, Key, Mouse, MouseKind};
 use crate::listdiff::{self, Op};
+use crate::motion::Pos;
 use crate::proc;
 use crate::pty::Pty;
-use crate::render;
+use crate::render::{self, Bar};
 use crate::session::{Saved, Session};
 use crate::state::{self, View};
+use crate::status::{Entry, Info};
 use crate::vt::{self, Modes};
 
 pub enum Event {
@@ -27,12 +29,20 @@ pub enum Event {
     Resize,
 }
 
+// output this soon after a spawn or resize is the program starting or redrawing, not activity
+const SPAWN_QUIET: Duration = Duration::from_millis(1000);
+const RESIZE_QUIET: Duration = Duration::from_millis(250);
+
 pub struct Term {
     id: u64,
     name: String,
     cwd: PathBuf,
     pty: Pty,
     vt: vt::Parser,
+    /// output or a bell since it was last viewed
+    activity: bool,
+    bell: bool,
+    quiet: Instant,
 }
 
 impl Term {
@@ -56,6 +66,10 @@ pub struct App {
     tx: Sender<Event>,
     /// view n was just entered with `<C-\>`, so another one sends it literally
     fresh: bool,
+    /// view n was entered with the wheel, so scrolling back to the bottom returns to view i
+    wheeled: bool,
+    /// where the left button went down in view i, for a drag that turns into a view n selection
+    press: Option<(u16, u16)>,
     /// view n's text is behind the terminal
     stale: bool,
     last: Option<u64>,
@@ -108,6 +122,8 @@ impl App {
             cwd: cwd.clone(),
             tx,
             fresh: false,
+            wheeled: false,
+            press: None,
             stale: false,
             last: None,
             alt: None,
@@ -142,17 +158,24 @@ impl App {
         self.list.message = Some(msg);
     }
 
+    /// The bar takes a row from every terminal, so ptys keep their size across views.
+    fn term_rows(&self) -> u16 {
+        if self.config.status.enabled { self.rows.saturating_sub(1).max(1) } else { self.rows }
+    }
+
     fn size_buffers(&mut self) {
         self.list.height = self.rows.saturating_sub(1).max(1) as usize;
-        self.normal.height = self.rows.max(1) as usize;
+        self.normal.height = self.term_rows().max(1) as usize;
     }
 
     fn spawn(&mut self, name: String, cwd: PathBuf) -> Result<Term> {
         let id = self.next_id;
         self.next_id += 1;
-        let pty = Pty::spawn(self.cols, self.rows, &cwd)?;
+        let rows = self.term_rows();
+        let pty = Pty::spawn(self.cols, rows, &cwd)?;
         pump(pty.reader()?, self.tx.clone(), move |b| Event::Output(id, b), Event::Exited(id));
-        Ok(Term { id, name, cwd, pty, vt: vt::parser(self.cols, self.rows) })
+        let vt = vt::parser(self.cols, rows);
+        Ok(Term { id, name, cwd, pty, vt, activity: false, bell: false, quiet: Instant::now() + SPAWN_QUIET })
     }
 
     fn lines(&self) -> Vec<Line> {
@@ -177,10 +200,13 @@ impl App {
     /// Switches view, remembering the previous terminal for `<C-^>`.
     fn set_view(&mut self, view: View) {
         self.view = view;
-        if let Some(id) = self.viewing()
-            && self.last != Some(id)
-        {
+        self.wheeled = false;
+        let Some(id) = self.viewing() else { return };
+        if self.last != Some(id) {
             self.alt = self.last.replace(id);
+        }
+        if let Some(t) = self.term(id) {
+            (t.activity, t.bell) = (false, false);
         }
     }
 
@@ -242,6 +268,7 @@ impl App {
         match event {
             Event::Output(id, bytes) => {
                 let normal = self.view == View::Normal(id);
+                let viewed = self.viewing() == Some(id);
                 let Some(t) = self.term(id) else { return Ok(false) };
                 let screen = t.vt.screen_mut();
                 let before = vt::history(screen);
@@ -252,6 +279,13 @@ impl App {
                 if !replies.is_empty() {
                     t.pty.write(&replies)?;
                 }
+                let flags = (t.activity, t.bell);
+                let bell = std::mem::take(&mut t.vt.callbacks_mut().bell);
+                if !viewed {
+                    t.bell |= bell;
+                    t.activity |= Instant::now() >= t.quiet;
+                }
+                let flagged = (t.activity, t.bell) != flags;
                 // view n: a cursor on the last line follows output, anywhere else its text stays put
                 if normal {
                     self.stale = true;
@@ -260,7 +294,7 @@ impl App {
                         self.normal.top += grew;
                     }
                 }
-                Ok(self.viewing() == Some(id))
+                Ok(viewed || (flagged && self.config.status.enabled))
             }
             Event::Exited(id) => {
                 let Some(t) = self.remove(id) else { return Ok(false) };
@@ -276,9 +310,11 @@ impl App {
                 let (cols, rows) = crossterm::terminal::size()?;
                 (self.cols, self.rows) = (cols, rows);
                 self.size_buffers();
+                let rows = self.term_rows();
                 for t in &mut self.terms {
                     t.pty.resize(cols, rows)?;
                     t.vt.screen_mut().set_size(rows, cols);
+                    t.quiet = t.quiet.max(Instant::now() + RESIZE_QUIET);
                 }
                 if let View::Normal(id) = self.view {
                     self.enter_normal(id);
@@ -325,6 +361,7 @@ impl App {
 
     fn input(&mut self, input: Input) -> Result<()> {
         let bytes = match (self.view, input) {
+            (_, Input::Mouse(m)) => return self.mouse(m),
             (View::Insert(id), input) => {
                 let (next, out) = state::step(self.view, input, self.config.escape);
                 if let Some(t) = self.term(id)
@@ -371,6 +408,7 @@ impl App {
 
     fn normal_key(&mut self, id: u64, key: Key) -> Result<()> {
         self.fresh = false;
+        self.wheeled = false;
         self.refresh_normal();
         let effects = self.normal.key(key);
         crate::log::log(format_args!("  normal {key:?} -> {:?} {effects:?}", self.normal.mode));
@@ -412,6 +450,82 @@ impl App {
                 }
                 Effect::Open(_) | Effect::Write => {}
             }
+        }
+        Ok(())
+    }
+
+    /// The program in view i asked for the mouse, so events go to it as they are.
+    fn program_mouse(&self, id: u64) -> bool {
+        !self.config.mouse || self.terms.iter().any(|t| t.id == id && vt::modes(&t.vt).mouse != 0)
+    }
+
+    fn mouse(&mut self, m: Mouse) -> Result<()> {
+        let kind = m.kind();
+        match self.view {
+            View::Insert(id) if self.program_mouse(id) => {
+                if let Some(t) = self.term(id) {
+                    t.pty.write(&m.encode())?;
+                }
+            }
+            View::Insert(id) => self.insert_mouse(id, m, kind)?,
+            View::Normal(id) => match kind {
+                MouseKind::WheelUp | MouseKind::WheelDown => {
+                    self.refresh_normal();
+                    let down = kind == MouseKind::WheelDown;
+                    self.normal.wheel(down);
+                    if down && self.wheeled && self.normal.at_bottom() {
+                        self.set_view(View::Insert(id));
+                    }
+                }
+                MouseKind::Press | MouseKind::Drag => {
+                    self.refresh_normal();
+                    let at = cell_pos(&self.normal, m.cell());
+                    self.normal.click(at, kind == MouseKind::Drag);
+                }
+                MouseKind::Other => {}
+            },
+            View::List if self.confirm.is_some() => {}
+            View::List => match kind {
+                MouseKind::WheelUp | MouseKind::WheelDown => self.list.wheel(kind == MouseKind::WheelDown),
+                MouseKind::Press | MouseKind::Drag => {
+                    let at = cell_pos(&self.list, m.cell());
+                    self.list.click(at, kind == MouseKind::Drag);
+                }
+                MouseKind::Other => {}
+            },
+        }
+        Ok(())
+    }
+
+    /// View i with a program that left the mouse alone: the wheel scrolls like a terminal would, a drag selects.
+    fn insert_mouse(&mut self, id: u64, m: Mouse, kind: MouseKind) -> Result<()> {
+        let Some(t) = self.term(id) else { return Ok(()) };
+        let up = kind == MouseKind::WheelUp;
+        match kind {
+            // full-screen programs get arrow keys, as the outer terminal's alternate scroll would send
+            MouseKind::WheelUp | MouseKind::WheelDown if t.vt.screen().alternate_screen() => {
+                let arrow = match (up, t.vt.screen().application_cursor()) {
+                    (true, false) => "\x1b[A",
+                    (false, false) => "\x1b[B",
+                    (true, true) => "\x1bOA",
+                    (false, true) => "\x1bOB",
+                };
+                t.pty.write(arrow.repeat(buffer::WHEEL).as_bytes())?;
+            }
+            MouseKind::WheelUp if vt::history(t.vt.screen_mut()) > 0 => {
+                self.enter_normal(id);
+                self.normal.wheel(false);
+                self.wheeled = true;
+            }
+            MouseKind::Press => self.press = Some(m.cell()),
+            MouseKind::Drag => {
+                let from = self.press.take().unwrap_or(m.cell());
+                self.enter_normal(id);
+                let from = cell_pos(&self.normal, from);
+                self.normal.click(from, false);
+                self.normal.click(cell_pos(&self.normal, m.cell()), true);
+            }
+            _ => {}
         }
         Ok(())
     }
@@ -530,16 +644,52 @@ impl App {
         ids
     }
 
+    /// The bottom row's status. Without the bar the list still shows its mode and `[+]`, as before.
+    fn bar(&self) -> Option<Bar> {
+        let status = &self.config.status;
+        if !status.enabled {
+            let modified = if self.list.modified() { "[+]" } else { "" };
+            return (self.view == View::List).then(|| Bar { left: self.list.mode.label().into(), right: modified.into() });
+        }
+        let viewing = self.viewing();
+        let alternate = if viewing.is_some() { self.alt } else { self.last };
+        let terms = self
+            .terms
+            .iter()
+            .map(|t| Entry {
+                name: &t.name,
+                current: viewing == Some(t.id),
+                alternate: alternate == Some(t.id),
+                activity: t.activity,
+                bell: t.bell,
+            })
+            .collect();
+        let mode = match self.view {
+            View::List => self.list.mode.label(),
+            View::Normal(_) => self.normal.mode.label(),
+            View::Insert(_) => "-- TERMINAL --",
+        };
+        let info = Info { mode, modified: self.list.modified(), terms };
+        Some(Bar { left: status.left.expand(&info), right: status.right.expand(&info) })
+    }
+
+    /// Button and drag events in SGR encoding, when vix has the mouse.
+    fn mouse_modes(&self, modes: Modes) -> Modes {
+        if self.config.mouse { Modes { mouse: 1002, mouse_encoding: 1006, ..modes } } else { modes }
+    }
+
     pub fn draw(&mut self, terminal: &mut DefaultTerminal) -> Result<()> {
         if self.viewing().is_some_and(|id| !self.alive(id)) {
             self.view = View::List;
         }
         self.refresh_normal();
+        let bar = self.bar();
         let modes = match self.view {
             View::List => {
                 let insert = self.list.mode == buffer::Mode::Insert;
-                terminal.draw(|f| render::list(f, &self.list))?;
-                Modes { cursor_shape: if insert { 6 } else { 0 }, ..Default::default() }
+                let bar = bar.as_ref().expect("the list always has a bar");
+                terminal.draw(|f| render::list(f, &self.list, bar))?;
+                self.mouse_modes(Modes { cursor_shape: if insert { 6 } else { 0 }, ..Default::default() })
             }
             View::Normal(id) => {
                 let top = self.normal.top;
@@ -548,15 +698,16 @@ impl App {
                 let total = vt::history(screen);
                 screen.set_scrollback(total.saturating_sub(top));
                 let normal = &self.normal;
-                let drawn = terminal.draw(|f| render::term(f, screen, Some(normal)));
+                let drawn = terminal.draw(|f| render::term(f, screen, Some(normal), bar.as_ref()));
                 screen.set_scrollback(0);
                 drawn?;
-                Modes::default()
+                self.mouse_modes(Modes::default())
             }
             View::Insert(id) => {
                 let t = self.terms.iter().find(|t| t.id == id).expect("checked above");
-                terminal.draw(|f| render::term(f, t.vt.screen(), None))?;
-                vt::modes(&t.vt)
+                terminal.draw(|f| render::term(f, t.vt.screen(), None, bar.as_ref()))?;
+                let modes = vt::modes(&t.vt);
+                if modes.mouse == 0 { self.mouse_modes(modes) } else { modes }
             }
         };
         if self.outer != Some(modes) {
@@ -567,4 +718,11 @@ impl App {
         }
         Ok(())
     }
+}
+
+/// Buffer position under screen cell (x, y), held to the visible lines.
+fn cell_pos(buf: &Buffer, (x, y): (u16, u16)) -> Pos {
+    let y = (y as usize).min(buf.height.max(1) - 1);
+    let row = (buf.top + y).min(buf.lines.len() - 1);
+    (row, render::col_at(&buf.lines[row].text, x))
 }

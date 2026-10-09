@@ -3,7 +3,7 @@ use ratatui::layout::{Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Line;
 use ratatui::widgets::{Clear, Paragraph};
-use unicode_width::UnicodeWidthStr;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::buffer::{Buffer, Mode};
 
@@ -12,16 +12,36 @@ fn x_of(text: &str, col: usize) -> u16 {
     text.chars().take(col).collect::<String>().width() as u16
 }
 
-/// What the bottom row says, vim-style.
-fn status(buf: &Buffer) -> String {
-    match (&buf.mode, &buf.message) {
-        (Mode::Command, _) => format!("{}{}", buf.prompt, buf.cmdline),
-        (_, Some(msg)) => msg.clone(),
-        (Mode::Insert, _) => "-- INSERT --".into(),
-        (Mode::Visual { line: false }, _) => "-- VISUAL --".into(),
-        (Mode::Visual { line: true }, _) => "-- VISUAL LINE --".into(),
-        (Mode::Normal, _) => String::new(),
+/// Char index of the cell at screen column `x`.
+pub fn col_at(text: &str, x: u16) -> usize {
+    let mut width = 0;
+    for (i, c) in text.chars().enumerate() {
+        width += c.width().unwrap_or(0);
+        if width > x as usize {
+            return i;
+        }
     }
+    text.chars().count()
+}
+
+/// The bottom row's text when no command line or message takes it over.
+pub struct Bar {
+    pub left: String,
+    pub right: String,
+}
+
+/// The command line or a message, which take over the bottom row.
+fn prompt(buf: &Buffer) -> Option<String> {
+    match (&buf.mode, &buf.message) {
+        (Mode::Command, _) => Some(format!("{}{}", buf.prompt, buf.cmdline)),
+        (_, Some(msg)) => Some(msg.clone()),
+        _ => None,
+    }
+}
+
+/// What a buffer drawn over a terminal without a bar says, vim-style.
+fn overlay(buf: &Buffer) -> String {
+    prompt(buf).unwrap_or_else(|| buf.mode.label().into())
 }
 
 /// Reverses the visual selection's visible cells, with `top` the buffer row at y = 0.
@@ -48,29 +68,38 @@ fn highlight(frame: &mut Frame, buf: &Buffer, top: usize, height: u16) {
     }
 }
 
-/// Draws the bottom row (if `always` or there's something to say) and places the cursor.
-fn chrome(frame: &mut Frame, buf: &Buffer, top: usize, always: bool) {
+/// Draws the bottom row: always with a bar, else only when there's something to say.
+fn bottom(frame: &mut Frame, buf: Option<&Buffer>, bar: Option<&Bar>) {
     let area = frame.area();
-    let bottom = area.height.saturating_sub(1);
-    let status = status(buf);
-    let row = Rect { y: bottom, height: 1, ..area };
-    if always || !status.is_empty() {
-        frame.render_widget(Clear, row);
-        frame.render_widget(Paragraph::new(status.as_str()), row);
+    let row = Rect { y: area.height.saturating_sub(1), height: 1, ..area };
+    let Some(bar) = bar else {
+        let text = buf.map(overlay).unwrap_or_default();
+        if !text.is_empty() {
+            frame.render_widget(Clear, row);
+            frame.render_widget(Paragraph::new(text), row);
+        }
+        return;
+    };
+    frame.render_widget(Clear, row);
+    if !buf.is_some_and(|b| b.mode == Mode::Command) {
+        frame.render_widget(Paragraph::new(bar.right.as_str()).right_aligned(), row);
     }
-    if always && buf.modified() {
-        frame.render_widget(Paragraph::new("[+]").right_aligned(), row);
-    }
-    let cursor = if buf.mode == Mode::Command {
+    let left = buf.and_then(prompt).unwrap_or_else(|| bar.left.clone());
+    frame.render_widget(Paragraph::new(left), row);
+}
+
+fn cursor(frame: &mut Frame, buf: &Buffer, top: usize) {
+    let bottom = frame.area().height.saturating_sub(1);
+    let at = if buf.mode == Mode::Command {
         Position::new(1 + buf.cmdline.width() as u16, bottom)
     } else {
         let (r, c) = buf.cursor;
         Position::new(x_of(&buf.lines[r].text, c), r.saturating_sub(top) as u16)
     };
-    frame.set_cursor_position(cursor);
+    frame.set_cursor_position(at);
 }
 
-pub fn list(frame: &mut Frame, buf: &Buffer) {
+pub fn list(frame: &mut Frame, buf: &Buffer, bar: &Bar) {
     let area = frame.area();
     let height = area.height.saturating_sub(1);
     let tilde = Style::new().fg(Color::Blue);
@@ -82,7 +111,8 @@ pub fn list(frame: &mut Frame, buf: &Buffer) {
         .collect();
     frame.render_widget(Paragraph::new(rows), area);
     highlight(frame, buf, buf.top, height);
-    chrome(frame, buf, buf.top, true);
+    bottom(frame, Some(buf), Some(bar));
+    cursor(frame, buf, buf.top);
 }
 
 fn color(c: vt100::Color) -> Color {
@@ -95,13 +125,14 @@ fn color(c: vt100::Color) -> Color {
 
 /// Copies a terminal's screen (at its current scrollback offset) into the frame.
 /// With `normal`, that buffer's cursor, selection, and command line are drawn over it (view n).
-pub fn term(frame: &mut Frame, screen: &vt100::Screen, normal: Option<&Buffer>) {
+/// With `bar`, the screen is a row shorter than the frame and the bar takes the bottom row.
+pub fn term(frame: &mut Frame, screen: &vt100::Screen, normal: Option<&Buffer>, bar: Option<&Bar>) {
     let area = frame.area();
     // like vim, scroll a line when the bottom row would cover the cursor
-    let shift = normal.map_or(0, |b| {
-        let covered = !status(b).is_empty() && b.cursor.0 + 1 >= b.top + area.height as usize;
-        u16::from(covered)
-    });
+    let shift = match (normal, bar) {
+        (Some(b), None) => u16::from(!overlay(b).is_empty() && b.cursor.0 + 1 >= b.top + area.height as usize),
+        _ => 0,
+    };
     let out = frame.buffer_mut();
     for y in 0..area.height {
         for x in 0..area.width {
@@ -129,13 +160,16 @@ pub fn term(frame: &mut Frame, screen: &vt100::Screen, normal: Option<&Buffer>) 
         Some(buf) => {
             let top = buf.top + shift as usize;
             highlight(frame, buf, top, area.height);
-            chrome(frame, buf, top, false);
+            bottom(frame, Some(buf), bar);
+            cursor(frame, buf, top);
         }
-        None if !screen.hide_cursor() => {
-            let (row, col) = screen.cursor_position();
-            frame.set_cursor_position(Position::new(col, row));
+        None => {
+            bottom(frame, None, bar);
+            if !screen.hide_cursor() {
+                let (row, col) = screen.cursor_position();
+                frame.set_cursor_position(Position::new(col, row));
+            }
         }
-        None => {}
     }
 }
 
@@ -148,5 +182,14 @@ mod tests {
         assert_eq!(x_of("ab", 1), 1);
         assert_eq!(x_of("日本x", 2), 4);
         assert_eq!(x_of("ab", 9), 2);
+    }
+
+    #[test]
+    fn col_at_inverts_x_of() {
+        assert_eq!(col_at("ab", 1), 1);
+        assert_eq!(col_at("日本x", 2), 1);
+        assert_eq!(col_at("日本x", 3), 1);
+        assert_eq!(col_at("日本x", 4), 2);
+        assert_eq!(col_at("ab", 9), 2);
     }
 }

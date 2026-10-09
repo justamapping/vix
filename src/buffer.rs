@@ -18,6 +18,18 @@ pub enum Mode {
     Command,
 }
 
+impl Mode {
+    /// What vim's 'showmode' says.
+    pub fn label(self) -> &'static str {
+        match self {
+            Mode::Insert => "-- INSERT --",
+            Mode::Visual { line: false } => "-- VISUAL --",
+            Mode::Visual { line: true } => "-- VISUAL LINE --",
+            Mode::Normal | Mode::Command => "",
+        }
+    }
+}
+
 #[derive(Debug, PartialEq)]
 pub enum Effect {
     Open(usize),
@@ -40,6 +52,9 @@ enum Register {
 }
 
 const READONLY: &str = "E21: Cannot make changes, 'modifiable' is off";
+
+/// Lines a mouse wheel notch scrolls, as in vim.
+pub const WHEEL: usize = 3;
 
 /// A small vim over lines that carry hidden ids.
 pub struct Buffer {
@@ -170,6 +185,33 @@ impl Buffer {
         let (keys, wait) = remap::resolve(&self.maps, &self.typeahead, false);
         self.typeahead = wait;
         keys.into_iter().flat_map(|k| self.press(k)).collect()
+    }
+
+    /// Scrolls a wheel notch, keeping the cursor on screen.
+    pub fn wheel(&mut self, down: bool) {
+        self.scroll_by(if down { Scroll::LineDown } else { Scroll::LineUp }, Some(WHEEL));
+        self.clamp();
+    }
+
+    /// The last line is on screen.
+    pub fn at_bottom(&self) -> bool {
+        self.top + self.height.max(1) >= self.lines.len()
+    }
+
+    /// A left click moves the cursor; a drag selects from where it was, like vim's 'mouse'.
+    pub fn click(&mut self, pos: Pos, drag: bool) {
+        match self.mode {
+            Mode::Command => return,
+            Mode::Normal if drag => {
+                self.mode = Mode::Visual { line: false };
+                self.anchor = self.cursor;
+            }
+            Mode::Visual { .. } if !drag => self.mode = Mode::Normal,
+            _ => {}
+        }
+        self.pending.clear();
+        self.cursor = pos;
+        self.clamp();
     }
 
     /// A mapping is waiting on more keys.
@@ -883,6 +925,28 @@ mod tests {
         assert_eq!(scroll(0, 10, 10), 1);
         assert_eq!(scroll(5, 2, 10), 2);
         assert_eq!(scroll(5, 14, 10), 5);
+    }
+
+    #[test]
+    fn mouse() {
+        let lines: Vec<String> = (0..20).map(|i| format!("line {i}")).collect();
+        let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+        let mut b = view(&refs);
+        b.height = 5;
+        b.wheel(true);
+        assert_eq!((b.top, b.cursor.0), (3, 3));
+        b.click((5, 2), false);
+        b.click((6, 3), true);
+        assert_eq!(b.mode, Mode::Visual { line: false });
+        assert_eq!(feed(&mut b, "y"), vec![Effect::Yank("ne 5\nline".into())]);
+        b.click((1, 0), true);
+        b.click((2, 0), false);
+        assert_eq!(b.mode, Mode::Normal);
+        feed(&mut b, "G");
+        assert!(b.at_bottom());
+        b.wheel(false);
+        assert!(!b.at_bottom());
+        assert_eq!((b.top, b.cursor.0), (12, 16));
     }
 
     #[test]
