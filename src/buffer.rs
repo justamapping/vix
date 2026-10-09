@@ -38,8 +38,9 @@ pub enum Effect {
     QuitAll { force: bool },
     Reload,
     Yank(String),
-    /// keys a read-only buffer passes up: `i a I A`, `-`, `J`/`K`, `<C-^>`, and `1`-`9` as `Goto`
-    Insert,
+    /// keys a read-only buffer passes up: `i a I A` with where they'd insert (`o O` without), `-`, `J`/`K`, `<C-^>`,
+    /// and `1`-`9` as `Goto`
+    Insert(Option<Pos>),
     Parent,
     Switch(isize),
     Alternate,
@@ -363,7 +364,7 @@ impl Buffer {
                 }
             }
             Action::Operate(Operator::Yank, target) => return self.operate(Operator::Yank, target, count),
-            Action::Insert(_) if self.readonly => return vec![Effect::Insert],
+            Action::Insert(at) if self.readonly => return vec![Effect::Insert(self.insert_at(at))],
             Action::Operate(..) | Action::Insert(_) | Action::Paste { .. } if self.readonly => {
                 self.message = Some(READONLY.into());
             }
@@ -602,22 +603,27 @@ impl Buffer {
         self.cursor = start;
     }
 
+    /// Where `i a I A` start inserting; `o O` open a line instead.
+    fn insert_at(&self, at: InsertAt) -> Option<Pos> {
+        let (row, col) = self.cursor;
+        let text = &self.lines[row].text;
+        match at {
+            InsertAt::Before => Some((row, col)),
+            InsertAt::After => Some((row, (col + 1).min(char_len(text)))),
+            InsertAt::LineStart => Some((row, motion::first_non_blank(text))),
+            InsertAt::LineEnd => Some((row, char_len(text))),
+            InsertAt::Below | InsertAt::Above => None,
+        }
+    }
+
     fn start_insert(&mut self, at: InsertAt) {
         self.snapshot();
-        let (row, col) = self.cursor;
-        let len = char_len(&self.lines[row].text);
         self.mode = Mode::Insert;
-        self.cursor = match at {
-            InsertAt::Before => (row, col),
-            InsertAt::After => (row, (col + 1).min(len)),
-            InsertAt::LineStart => (row, motion::first_non_blank(&self.lines[row].text)),
-            InsertAt::LineEnd => (row, len),
-            InsertAt::Below | InsertAt::Above => {
-                let r = if at == InsertAt::Below { row + 1 } else { row };
-                self.lines.insert(r, Line { id: None, text: String::new() });
-                (r, 0)
-            }
-        };
+        self.cursor = self.insert_at(at).unwrap_or_else(|| {
+            let r = if at == InsertAt::Below { self.cursor.0 + 1 } else { self.cursor.0 };
+            self.lines.insert(r, Line { id: None, text: String::new() });
+            (r, 0)
+        });
     }
 
     fn insert(&mut self, key: Key) {
@@ -937,7 +943,9 @@ mod tests {
         assert_eq!(feed(&mut b, "dd"), vec![]);
         assert_eq!(b.lines.len(), 2);
         assert!(b.message.as_deref().unwrap().starts_with("E21"));
-        assert_eq!(feed(&mut b, "a"), vec![Effect::Insert]);
+        assert_eq!(feed(&mut b, "a"), vec![Effect::Insert(Some((0, 1)))]);
+        assert_eq!(feed(&mut b, "A"), vec![Effect::Insert(Some((0, 4)))]);
+        assert_eq!(feed(&mut b, "o"), vec![Effect::Insert(None)]);
         assert_eq!(feed(&mut b, "-"), vec![Effect::Parent]);
         assert_eq!(feed(&mut b, "K"), vec![Effect::Switch(-1)]);
         assert_eq!(feed(&mut b, "3"), vec![Effect::Goto(3)]);

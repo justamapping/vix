@@ -70,6 +70,17 @@ pub fn text(screen: &mut Screen) -> Vec<String> {
     lines
 }
 
+/// Char index into a row's text of column `col`; a wide char is one char over two columns.
+pub fn index(screen: &Screen, row: u16, col: u16) -> usize {
+    (0..col).filter(|&c| !screen.cell(row, c).is_some_and(|cell| cell.is_wide_continuation())).count()
+}
+
+/// Column of char `index` on `row`, or the row's width past its end.
+pub fn column(screen: &Screen, row: u16, index: usize) -> u16 {
+    let cols = screen.size().1;
+    (0..cols).filter(|&c| !screen.cell(row, c).is_some_and(|cell| cell.is_wide_continuation())).nth(index).unwrap_or(cols)
+}
+
 /// Sets the outer terminal's clipboard.
 pub fn osc52(text: &str) -> Vec<u8> {
     format!("\x1b]52;c;{}\x07", base64::engine::general_purpose::STANDARD.encode(text)).into_bytes()
@@ -148,6 +159,14 @@ mod tests {
     fn text_without_scrollback() {
         let mut p = feed(b"hi");
         assert_eq!(text(p.screen_mut()).len(), 24);
+    }
+
+    #[test]
+    fn wide_chars_index_once() {
+        let p = feed("a日b".as_bytes());
+        assert_eq!(index(p.screen(), 0, 3), 2);
+        assert_eq!(column(p.screen(), 0, 2), 3);
+        assert_eq!(column(p.screen(), 0, 100), 80);
     }
 
     #[test]

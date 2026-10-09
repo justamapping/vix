@@ -39,6 +39,13 @@ impl Pty {
         self.master.resize(size(cols, rows))
     }
 
+    /// Whether the program reads keys as they come, like a line editor, rather than the kernel's cooked lines.
+    pub fn raw(&self) -> bool {
+        let Some(fd) = self.master.as_raw_fd() else { return false };
+        let mut t: libc::termios = unsafe { std::mem::zeroed() };
+        unsafe { libc::tcgetattr(fd, &mut t) == 0 && t.c_lflag & libc::ICANON == 0 }
+    }
+
     pub fn pid(&self) -> Option<u32> {
         self.child.process_id()
     }

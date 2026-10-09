@@ -9,8 +9,10 @@ use anyhow::Result;
 use ratatui::DefaultTerminal;
 
 use crate::buffer::{self, Buffer, Effect, Line};
+use crate::carry;
 use crate::config::Config;
 use crate::dump;
+use crate::follow;
 use crate::input::{self, Input, Key, Mouse, MouseKind};
 use crate::listdiff::{self, Op};
 use crate::motion::Pos;
@@ -228,12 +230,11 @@ impl App {
     fn enter_normal(&mut self, id: u64) {
         let Some(t) = self.term(id) else { return };
         let screen = t.vt.screen_mut();
-        let total = vt::history(screen);
-        let (row, col) = screen.cursor_position();
+        let live = follow::live(screen);
         let lines = vt::text(screen).into_iter().map(|text| Line { id: None, text }).collect();
         self.normal.load(lines);
         self.normal.message = None;
-        self.normal.place((total + row as usize, col as usize), total);
+        self.normal.place(live.cursor, live.bottom);
         self.stale = false;
         self.set_view(View::Normal(id));
     }
@@ -280,11 +281,9 @@ impl App {
                 let normal = self.view == View::Normal(id);
                 let viewed = self.viewing() == Some(id);
                 let Some(t) = self.term(id) else { return Ok(false) };
-                let screen = t.vt.screen_mut();
-                let before = vt::history(screen);
-                let rows = screen.size().0 as usize;
+                let before = follow::live(t.vt.screen_mut());
                 t.vt.process(&bytes);
-                let grew = vt::history(t.vt.screen_mut()).saturating_sub(before);
+                let after = follow::live(t.vt.screen_mut());
                 let replies = std::mem::take(&mut t.vt.callbacks_mut().replies);
                 if !replies.is_empty() {
                     t.pty.write(&replies)?;
@@ -296,12 +295,10 @@ impl App {
                     t.activity |= Instant::now() >= t.quiet;
                 }
                 let flagged = (t.activity, t.bell) != flags;
-                // view n: a cursor on the last line follows output, anywhere else its text stays put
                 if normal {
                     self.stale = true;
-                    if self.normal.cursor.0 + 1 == before + rows {
-                        self.normal.cursor.0 += grew;
-                        self.normal.top += grew;
+                    if self.normal.mode == buffer::Mode::Normal {
+                        (self.normal.cursor, self.normal.top) = follow::follow(self.normal.cursor, self.normal.top, before, after);
                     }
                 }
                 Ok(viewed || (flagged && self.config.status.enabled))
@@ -471,7 +468,12 @@ impl App {
     fn normal_effects(&mut self, id: u64, effects: Vec<Effect>) -> Result<()> {
         for effect in effects {
             match effect {
-                Effect::Insert => self.set_view(View::Insert(id)),
+                Effect::Insert(at) => {
+                    if let Some(at) = at {
+                        self.carry(id, at)?;
+                    }
+                    self.set_view(View::Insert(id));
+                }
                 Effect::Parent | Effect::Quit { force: false } => self.go_list(id),
                 Effect::Quit { force: true } => {
                     if let Some(mut t) = self.remove(id) {
@@ -511,6 +513,19 @@ impl App {
                 Effect::Rename(name) => self.rename(id, name),
                 Effect::Open(_) | Effect::Write => {}
             }
+        }
+        Ok(())
+    }
+
+    /// Moves a line editor's cursor to where `i a I A` asked, when that's on its line; anywhere else it stays put.
+    fn carry(&mut self, id: u64, (row, index): Pos) -> Result<()> {
+        let Some(t) = self.term(id) else { return Ok(()) };
+        if !t.pty.raw() {
+            return Ok(());
+        }
+        let Some(row) = row.checked_sub(vt::history(t.vt.screen_mut())) else { return Ok(()) };
+        if let Some(keys) = carry::arrows(t.vt.screen(), row as u16, index) {
+            t.pty.write(&keys)?;
         }
         Ok(())
     }
