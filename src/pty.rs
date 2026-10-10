@@ -1,3 +1,4 @@
+use std::ffi::OsStr;
 use std::io::{Read, Write};
 use std::path::Path;
 
@@ -15,11 +16,14 @@ fn size(cols: u16, rows: u16) -> PtySize {
 }
 
 impl Pty {
-    /// Spawns the user's shell in `cwd`.
-    pub fn spawn(cols: u16, rows: u16, cwd: &Path) -> Result<Self> {
+    /// Spawns the user's shell in `cwd`, with `env` added to its environment.
+    pub fn spawn(cols: u16, rows: u16, cwd: &Path, env: &[(&str, &OsStr)]) -> Result<Self> {
         let pair = native_pty_system().openpty(size(cols, rows))?;
         let mut cmd = CommandBuilder::new_default_prog();
         cmd.cwd(cwd);
+        for (key, value) in env {
+            cmd.env(key, value);
+        }
         let child = pair.slave.spawn_command(cmd)?;
         let writer = pair.master.take_writer()?;
         Ok(Self { master: pair.master, writer, child })

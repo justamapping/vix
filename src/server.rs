@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::{self, Sender};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 
@@ -61,6 +61,8 @@ pub struct Server {
     /// the first Hello spawned the session
     started: bool,
     killed: bool,
+    /// when the last attached client left, or it started
+    left: SystemTime,
     /// where `KillSession` leaves the `--resume` snapshot
     snapshot: PathBuf,
     tx: Sender<Event>,
@@ -92,7 +94,7 @@ pub fn serve(listener: UnixListener, path: &Path, name: &str, snapshot: PathBuf)
     });
     let mut server = Server {
         name: name.into(),
-        mux: Mux::new(tx.clone(), 80, 24, std::env::current_dir()?),
+        mux: Mux::new(tx.clone(), 80, 24, std::env::current_dir()?, Some(path.to_path_buf())),
         clients: HashMap::new(),
         next_client: 0,
         workflow: None,
@@ -100,6 +102,7 @@ pub fn serve(listener: UnixListener, path: &Path, name: &str, snapshot: PathBuf)
         size: (80, 24),
         started: false,
         killed: false,
+        left: SystemTime::now(),
         snapshot,
         tx,
     };
@@ -129,9 +132,7 @@ impl Server {
     fn handle(&mut self, event: Event) -> Result<()> {
         match event {
             Event::Connect(stream) => self.connect(stream)?,
-            Event::Gone(cid) => {
-                self.clients.remove(&cid);
-            }
+            Event::Gone(cid) => self.drop_client(cid),
             Event::Pty(PtyEvent::Output(id, bytes)) => self.output(id, bytes),
             Event::Pty(PtyEvent::Exited(id)) => {
                 if self.mux.remove(id).is_some() {
@@ -263,7 +264,8 @@ impl Server {
             }
             Request::Info => {
                 let clients = self.clients.values().filter(|c| c.attached).count();
-                self.send(cid, &Reply::Info { name: self.name.clone(), terms: self.mux.len(), clients });
+                let since = self.left.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64);
+                self.send(cid, &Reply::Info { name: self.name.clone(), terms: self.mux.len(), clients, since });
             }
             Request::Detach => self.bye(cid, "detached"),
             Request::KillSession { cursor } => self.kill_session(cursor),
@@ -389,7 +391,13 @@ impl Server {
     /// Says why, then drops the client once that's sent.
     fn bye(&mut self, cid: usize, reason: &str) {
         self.send(cid, &Reply::Bye { reason: reason.into() });
-        self.clients.remove(&cid);
+        self.drop_client(cid);
+    }
+
+    fn drop_client(&mut self, cid: usize) {
+        if self.clients.remove(&cid).is_some_and(|c| c.attached) {
+            self.left = SystemTime::now();
+        }
     }
 
     /// Lets every client's writer finish, but not wait forever on one that stopped reading.
@@ -486,12 +494,14 @@ mod tests {
         let sh = list.terms[0].id;
         let mut replica = vt::parser(40, 10);
         replica.process(&screens[0].bytes);
-        a.send(Request::Input { id: sh, bytes: b"echo hi\r".to_vec() });
+        // shells know their session and id, for `vix ctl`
+        a.send(Request::Input { id: sh, bytes: b"echo \"hi $VIX_ID $VIX_SOCKET\"\r".to_vec() });
+        let hi = format!("hi {sh} {}", path.display());
         a.until(|r| {
             if let Reply::Output { bytes, .. } = r {
                 replica.process(&bytes);
             }
-            shows(&mut replica, "hi").then_some(())
+            shows(&mut replica, &hi).then_some(())
         });
 
         // a second client gets the same screen
@@ -500,7 +510,7 @@ mod tests {
         assert_eq!(names(&list), ["sh"]);
         let mut copy = vt::parser(40, 10);
         copy.process(&screens[0].bytes);
-        assert!(shows(&mut copy, "hi"));
+        assert!(shows(&mut copy, &hi));
 
         // only the client that spawned is told to open it
         b.send(Request::Spawn { name: "logs".into(), from: Some(sh) });

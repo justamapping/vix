@@ -302,3 +302,30 @@ fn detach_and_reattach_keep_the_screen() {
     vix.keys("\x1c-").keys("oapi\x1b").keys(":qd\r");
     assert_snapshot!("detach_refused", vix.screen());
 }
+
+#[test]
+fn list_attach_and_nesting() {
+    let home = Home::new();
+    let vix_bin = env!("CARGO_BIN_EXE_vix");
+    let mut vix = Vix::start(&home, &["demo"]);
+    vix.keys("\x1c").keys(":qd\r");
+    assert!(vix.exited());
+
+    // from a shell inside session 0
+    let mut vix = Vix::sized(&home, &[], 120, 12);
+    vix.keys("\r").keys(&format!("{vix_bin} -l\r"));
+    let screen = vix.screen();
+    assert!(screen.contains("\n0: 1 terminal (attached)\ndemo: 1 terminal\n"), "{screen}");
+    vix.keys(&format!("{vix_bin} -a 0\r"));
+    assert!(vix.screen().contains("already inside session 0"), "{}", vix.screen());
+
+    // the session detached last
+    let mut other = Vix::start(&home, &["-a"]);
+    other.keys("\x1c").keys(":qd\r");
+    assert!(other.exited());
+    assert!(other.screen().contains("[detached from demo]"), "{}", other.screen());
+
+    let mut none = Vix::start(&home, &["-a", "nope"]);
+    assert!(none.exited());
+    assert!(none.screen().contains("no session nope"), "{}", none.screen());
+}

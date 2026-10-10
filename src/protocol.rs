@@ -12,7 +12,7 @@ use crate::motion::Pos;
 use crate::session::{Saved, Session};
 
 /// Bump on any change to these types; client and server refuse to talk across versions.
-pub const VERSION: u32 = 2;
+pub const VERSION: u32 = 3;
 
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -52,7 +52,9 @@ pub enum Reply {
     Resized { cols: u16, rows: u16 },
     Exited { id: u64 },
     Message { text: String },
-    Info { name: String, terms: usize, clients: usize },
+    /// `since` is when its last client left, or it started, in unix ms; `vix -a` picks the latest
+    // defaulted, so `vix -l` still reads servers from before it
+    Info { name: String, terms: usize, clients: usize, #[serde(default)] since: u64 },
     /// the server is done with this client: killed, version mismatch
     Bye { reason: String },
 }
@@ -203,7 +205,7 @@ mod tests {
             Reply::Resized { cols: 80, rows: 24 },
             Reply::Exited { id: 3 },
             Reply::Message { text: "\"web\" 3 terminals written".into() },
-            Reply::Info { name: "0".into(), terms: 2, clients: 1 },
+            Reply::Info { name: "0".into(), terms: 2, clients: 1, since: 1_700_000_000_000 },
             Reply::Bye { reason: "killed".into() },
         ]);
     }

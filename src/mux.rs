@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::ffi::OsStr;
 use std::path::PathBuf;
 use std::sync::mpsc::Sender;
 use std::time::{Duration, Instant};
@@ -102,12 +103,14 @@ pub struct Mux<E> {
     rows: u16,
     /// where new terminals start when nothing else says
     pub cwd: PathBuf,
+    /// the session's socket, which shells get as `VIX_SOCKET` along with their `VIX_ID`
+    socket: Option<PathBuf>,
     tx: Sender<E>,
 }
 
 impl<E: From<PtyEvent> + Send + 'static> Mux<E> {
-    pub fn new(tx: Sender<E>, cols: u16, rows: u16, cwd: PathBuf) -> Self {
-        Self { terms: Vec::new(), next_id: 0, cols, rows, cwd, tx }
+    pub fn new(tx: Sender<E>, cols: u16, rows: u16, cwd: PathBuf, socket: Option<PathBuf>) -> Self {
+        Self { terms: Vec::new(), next_id: 0, cols, rows, cwd, socket, tx }
     }
 
     pub fn terms(&self) -> &[Term] {
@@ -137,7 +140,12 @@ impl<E: From<PtyEvent> + Send + 'static> Mux<E> {
     fn start(&mut self, name: String, cwd: PathBuf) -> Result<Term> {
         let id = self.next_id;
         self.next_id += 1;
-        let pty = Pty::spawn(self.cols, self.rows, &cwd)?;
+        let id_var = id.to_string();
+        let mut env = vec![("VIX_ID", OsStr::new(&id_var))];
+        if let Some(socket) = &self.socket {
+            env.push(("VIX_SOCKET", socket.as_os_str()));
+        }
+        let pty = Pty::spawn(self.cols, self.rows, &cwd, &env)?;
         pump(pty.reader()?, self.tx.clone(), move |b| PtyEvent::Output(id, b).into(), PtyEvent::Exited(id).into());
         let vt = vt::parser(self.cols, self.rows);
         Ok(Term { id, name, cwd, cmd: None, pty, vt, activity: false, bell: false, quiet: Instant::now() + SPAWN_QUIET })
@@ -303,7 +311,7 @@ mod tests {
     #[test]
     fn reconcile_keeps_kills_and_spawns_in_list_order() {
         let (tx, _rx) = mpsc::channel();
-        let mut mux: Mux<PtyEvent> = Mux::new(tx, 80, 24, std::env::temp_dir());
+        let mut mux: Mux<PtyEvent> = Mux::new(tx, 80, 24, std::env::temp_dir(), None);
         let a = mux.spawn(Saved::new("a", "/")).unwrap();
         let b = mux.spawn(Saved::new("b", "/")).unwrap();
         let ops = vec![

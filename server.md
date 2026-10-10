@@ -242,7 +242,7 @@ Once servers exist, the harness must also kill the session on drop, since killin
 | 3c | (done) `sock.rs`: socket dir, session names, stale sockets, `-l` info, starting the server | temp dir: naming, stale removal |
 | 3d | (done) `server.rs`: `vix --server`, accept, the loop over `Mux`, every `Request` | a test client on a temp socket: Hello, type `echo hi`, read it back, Kill, KillSession |
 | 3e | (done) `client.rs` + `App` on `Remote`, `main.rs` start-or-attach, `:qd`, hangup = detach | `tests/ui.rs`: type, `:qd`, `vix demo` again, same screen |
-| 3f | `-a`, `-l`, the nesting guard, version check, `-r` through the server, `VIX_SOCKET`/`VIX_ID` | drive.rs |
+| 3f | (done) `-a`, `-l`, the nesting guard, version check, `-r` through the server, `VIX_SOCKET`/`VIX_ID` | `tests/ui.rs`: `vix -l` and `vix -a 0` from inside session 0, `vix -a` from outside |
 | 3g | slow clients: bounded queue, on overflow drop and resend screens. Size follows latest | flood a terminal while a client is stopped |
 
 Notes from 3d:
@@ -262,9 +262,18 @@ Notes from 3e:
 - The picker sends `Refresh` when it opens, and takes the new directories when they arrive.
 - `Mux`'s `open`, `write`, and `Term::carry` are now only used by the server.
 - The UI harness kills every session under its `$HOME` on drop, since killing a client leaves its session running.
-- Not yet (3f): `-a`, `-l`, and the nesting guard. `vix demo` inside session `demo` attaches to itself.
 - Two `vix` started at the same moment can pick the same number. The second server fails to bind, and its client
   says `server exited, see <log>`.
+
+Notes from 3f:
+- `vix -a [name]` only attaches: `no session <name>` if it isn't running. Without a name it picks the session
+  detached last, preferring ones nobody is attached to. `Info` carries `since` for that, so `VERSION` is 3.
+- `vix -l` prints `demo: 3 terminals (attached)`, numbers first. `since` is defaulted, so it still reads older
+  servers, the one message that crosses versions.
+- `vix <name>` and `vix -a <name>` refuse the session you're inside (`already inside session <name>`), known from
+  `$VIX_SOCKET`. Plain `vix` nests a new session, and `vix -a` skips your own.
+- Shells get `VIX_SOCKET` and `VIX_ID` (the terminal's id in its session).
+- The version check and `-r` through the server were already done in 3d and 3e.
 
 After 3f it's shippable; 3g is hardening.
 

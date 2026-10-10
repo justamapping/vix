@@ -1,5 +1,6 @@
 //! Where sessions' sockets live, what they're named, and finding or starting a session's server.
 
+use std::fmt;
 use std::fs::{self, DirBuilder, File};
 use std::io::{self, BufReader, ErrorKind};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt};
@@ -18,6 +19,8 @@ use crate::session;
 // sun_path is 104 bytes on macOS and 108 on Linux, with the NUL
 const MAX_PATH: usize = 103;
 const START_TIMEOUT: Duration = Duration::from_secs(3);
+// a server answers Info at once; longer means it's stuck
+const INFO_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// `$XDG_RUNTIME_DIR/vix`, else `$TMPDIR/vix-<uid>` like tmux, created private.
 pub fn dir() -> Result<PathBuf> {
@@ -111,14 +114,52 @@ pub fn next_name<'a>(live: impl IntoIterator<Item = &'a str>) -> String {
     (0u64..).map(|n| n.to_string()).find(|n| !live.contains(&n.as_str())).expect("some number is free")
 }
 
-/// Asks a session about itself, for `vix -l`: (terminals, clients attached).
-pub fn info(stream: UnixStream) -> Result<(usize, usize)> {
+/// A running session, as `vix -l` shows it.
+#[derive(Debug, PartialEq)]
+pub struct Live {
+    pub name: String,
+    pub terms: usize,
+    pub clients: usize,
+    /// when its last client left, or it started, in unix ms
+    pub since: u64,
+}
+
+impl fmt::Display for Live {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        let s = if self.terms == 1 { "" } else { "s" };
+        write!(f, "{}: {} terminal{s}", self.name, self.terms)?;
+        match self.clients {
+            0 => Ok(()),
+            1 => write!(f, " (attached)"),
+            n => write!(f, " ({n} attached)"),
+        }
+    }
+}
+
+/// Asks a session about itself, without attaching.
+pub fn info(stream: UnixStream) -> Result<Live> {
+    stream.set_read_timeout(Some(INFO_TIMEOUT))?;
     protocol::send(&mut &stream, &Request::Info)?;
     match protocol::recv(&mut BufReader::new(&stream))? {
-        Some(Reply::Info { terms, clients, .. }) => Ok((terms, clients)),
+        Some(Reply::Info { name, terms, clients, since }) => Ok(Live { name, terms, clients, since }),
         Some(Reply::Bye { reason }) => bail!(reason),
         _ => bail!("no answer"),
     }
+}
+
+/// What `vix -a` attaches to: the most recently detached session, else the most recently left attached one. Never
+/// `inside`, the session this runs in.
+pub fn latest<'a>(live: &'a [Live], inside: Option<&str>) -> Option<&'a str> {
+    live.iter().filter(|l| Some(l.name.as_str()) != inside).max_by_key(|l| (l.clients == 0, l.since)).map(|l| l.name.as_str())
+}
+
+/// The session a shell runs in, from its `$VIX_SOCKET`, if that's a socket in `dir`.
+pub fn inside(dir: &Path, socket: Option<&Path>) -> Option<String> {
+    let socket = socket?;
+    if socket.parent() != Some(dir) {
+        return None;
+    }
+    Some(socket.file_name()?.to_str()?.strip_suffix(".sock")?.to_string())
 }
 
 /// Starts `vix --server <name>` and connects once it listens.
@@ -239,10 +280,39 @@ mod tests {
             let (stream, _) = listener.accept().unwrap();
             let request: Option<Request> = protocol::recv(&mut BufReader::new(&stream)).unwrap();
             assert_eq!(request, Some(Request::Info));
-            protocol::send(&mut &stream, &Reply::Info { name: "0".into(), terms: 3, clients: 1 }).unwrap();
+            protocol::send(&mut &stream, &Reply::Info { name: "0".into(), terms: 3, clients: 1, since: 5 }).unwrap();
         });
-        assert_eq!(info(connect(&path).unwrap().unwrap()).unwrap(), (3, 1));
+        let live = info(connect(&path).unwrap().unwrap()).unwrap();
+        assert_eq!(live, Live { name: "0".into(), terms: 3, clients: 1, since: 5 });
+        assert_eq!(live.to_string(), "0: 3 terminals (attached)");
         server.join().unwrap();
+    }
+
+    fn live(name: &str, clients: usize, since: u64) -> Live {
+        Live { name: name.into(), terms: 1, clients, since }
+    }
+
+    #[test]
+    fn lines_for_dash_l() {
+        assert_eq!(live("web", 0, 0).to_string(), "web: 1 terminal");
+        assert_eq!(Live { terms: 0, ..live("0", 2, 0) }.to_string(), "0: 0 terminals (2 attached)");
+    }
+
+    #[test]
+    fn latest_prefers_detached_then_recent_never_inside() {
+        let all = [live("0", 0, 10), live("web", 0, 30), live("api", 1, 50)];
+        assert_eq!(latest(&all, None), Some("web"));
+        assert_eq!(latest(&all, Some("web")), Some("0"));
+        assert_eq!(latest(&all[2..], None), Some("api"));
+        assert_eq!(latest(&all[2..], Some("api")), None);
+    }
+
+    #[test]
+    fn inside_reads_vix_socket() {
+        let dir = Path::new("/run/vix");
+        assert_eq!(inside(dir, Some(Path::new("/run/vix/web.sock"))).as_deref(), Some("web"));
+        assert_eq!(inside(dir, Some(Path::new("/elsewhere/web.sock"))), None);
+        assert_eq!(inside(dir, None), None);
     }
 
     #[test]

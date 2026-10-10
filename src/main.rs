@@ -20,7 +20,6 @@ mod remap;
 mod render;
 mod server;
 mod session;
-#[allow(dead_code)] // `-l` uses the rest, step 3f
 mod sock;
 mod state;
 mod status;
@@ -29,6 +28,7 @@ mod workflow;
 
 use std::io::{self, Write};
 use std::os::unix::net::UnixStream;
+use std::path::Path;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::thread;
 use std::time::Instant;
@@ -45,15 +45,19 @@ use session::Session;
 // events handled before a redraw, so a flooding program can't starve the screen
 const BATCH: usize = 256;
 
-const USAGE: &str = "usage: vix [-r | --resume] [workflow]";
+const USAGE: &str = "usage: vix [-r | --resume] [workflow]
+       vix -a | --attach [session]
+       vix -l | --list";
 
 fn main() -> Result<()> {
-    let mut resume = false;
+    let (mut resume, mut attach, mut list) = (false, false, false);
     let mut name: Option<String> = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "-r" | "--resume" => resume = true,
+            "-a" | "--attach" => attach = true,
+            "-l" | "--list" => list = true,
             // started by a client, not by hand
             "--server" => return server::run(&args.next().context("--server needs a session name")?),
             "-h" | "--help" => {
@@ -64,10 +68,16 @@ fn main() -> Result<()> {
             _ => name = Some(arg),
         }
     }
-    if resume && name.is_some() {
-        bail!("--resume and a workflow can't be used together\n{USAGE}");
+    if list {
+        if resume || attach || name.is_some() {
+            bail!("--list takes nothing else\n{USAGE}");
+        }
+        return list_sessions();
     }
-    let (session, stream, start, new_workflow) = connect(name, resume)?;
+    if resume && (attach || name.is_some()) {
+        bail!("--resume starts a new session, so it takes no name\n{USAGE}");
+    }
+    let (session, stream, start, new_workflow) = connect(name, resume, attach)?;
     let (config, config_error) = config::load();
 
     let (tx, rx) = mpsc::channel();
@@ -97,18 +107,45 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+/// `vix -l`: each running session, numbers first.
+fn list_sessions() -> Result<()> {
+    let sessions = sock::sessions(&sock::dir()?)?;
+    if sessions.is_empty() {
+        bail!("no sessions");
+    }
+    for (name, stream) in sessions {
+        match sock::info(stream) {
+            Ok(live) => println!("{live}"),
+            Err(e) => println!("{name}: {e:#}"),
+        }
+    }
+    Ok(())
+}
+
 /// Attaches to the session a workflow names if it's running, else starts one: from the workflow, `--resume`'s
-/// snapshot, or empty, under the lowest free number. Returns its name, the socket, what to start it from, and a
-/// message if the workflow is new.
-fn connect(workflow: Option<String>, resume: bool) -> Result<(String, UnixStream, Option<Start>, Option<String>)> {
+/// snapshot, or empty, under the lowest free number. With `attach`, only attaches, by default to the session
+/// detached last. Returns its name, the socket, what to start it from, and a message if the workflow is new.
+fn connect(workflow: Option<String>, resume: bool, attach: bool) -> Result<(String, UnixStream, Option<Start>, Option<String>)> {
     let dir = sock::dir()?;
+    let inside = sock::inside(&dir, std::env::var_os("VIX_SOCKET").as_deref().map(Path::new));
     let name = match &workflow {
         Some(w) => w.clone(),
+        None if attach => {
+            let live: Vec<sock::Live> = sock::sessions(&dir)?.into_iter().filter_map(|(_, s)| sock::info(s).ok()).collect();
+            sock::latest(&live, inside.as_deref()).context("no session to attach to")?.to_string()
+        }
         None => sock::next_name(sock::sessions(&dir)?.iter().map(|(n, _)| n.as_str())),
     };
+    // it would draw itself inside itself forever
+    if inside.as_deref() == Some(name.as_str()) {
+        bail!("already inside session {name}");
+    }
     let path = sock::path(&dir, &name)?;
     if let Some(stream) = sock::connect(&path)? {
         return Ok((name, stream, None, None));
+    }
+    if attach {
+        bail!("no session {name}");
     }
     let mut new = None;
     let session = match &workflow {
