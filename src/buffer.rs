@@ -1,9 +1,11 @@
+use serde::{Deserialize, Serialize};
+
 use crate::input::Key;
 use crate::keymap::{self, Action, Cmd, InsertAt, Motion, Operator, Parsed, Scroll, Target};
 use crate::motion::{self, Pos};
 use crate::remap::{self, Map};
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Line {
     pub id: Option<u64>,
     pub text: String,

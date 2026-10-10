@@ -165,8 +165,11 @@ enum Reply {                                       // server -> client
 
 struct List { terms: Vec<Entry>, workflow: Option<String>, open: Option<u64> }
 struct Entry { id: u64, name: String, cwd: PathBuf, cmd: Option<String>, activity: bool, bell: bool }
-struct Start { session: Session, workflow: Option<String> }   // what a new session spawns
+struct Start { workflow: Option<String>, cursor: usize, terms: Vec<Seed> }   // a Session, with output
 ```
+
+Done in 3b as `src/protocol.rs`. `Start` carries `Seed`s rather than a `Session` because `Saved.output` is
+left out of toml, and `-r` needs it. `VERSION` is bumped by hand on any change to these types.
 
 ### flows
 
@@ -232,7 +235,7 @@ Once servers exist, the harness must also kill the session on drop, since killin
 |---|---|---|
 | 3-0 | (done, `tests/ui.rs`) regression suite: today's `drive.rs` flows (`:w` ops, `:e :r :d`, exits under edits, picker, workflows, `-r`, bar overflow) recorded as expected screens against single-process vix | must still pass after 3e: userspace unchanged |
 | 3a | (done) `dump::exact`: scrollback, screens, alternate screen, cursor, modes | round trip into a fresh parser, cell for cell |
-| 3b | `protocol.rs`: the enums, NDJSON read/write | encode/decode round trip, base64 bytes |
+| 3b | (done) `protocol.rs`: the enums, NDJSON read/write | encode/decode round trip, base64 bytes |
 | 3c | `sock.rs`: socket dir, session names, stale sockets, `-l` info, starting the server | temp dir: naming, stale removal |
 | 3d | `server.rs`: `vix --server`, accept, the loop over `Mux`, every `Request` | a test client on a temp socket: Hello, type `echo hi`, read it back, Kill, KillSession |
 | 3e | `client.rs` + `App` on `Remote`, `main.rs` start-or-attach, `:qd`, hangup = detach | drive.rs: type, `:qd`, `vix -a`, same screen |

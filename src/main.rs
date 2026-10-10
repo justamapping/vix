@@ -13,6 +13,8 @@ mod motion;
 mod mux;
 mod picker;
 mod proc;
+#[allow(dead_code)] // used by the server and client, steps 3d and 3e
+mod protocol;
 mod pty;
 mod remap;
 mod render;
