@@ -112,19 +112,11 @@ Pty size follows the most recently active client (tmux's `window-size latest`).
 
 ### protocol
 
-Newline-delimited JSON over the unix socket, bytes as base64. Debuggable with `socat`, easy for agents; swap
-for binary frames only if a flood benchmark says so.
+Newline-delimited JSON over the unix socket, bytes as base64. Debuggable with `socat`, easy for agents. The flood
+measurement in 3g found no need for binary frames. The messages are in server.md's protocol section.
 
-```
-client -> server                         server -> client
-Hello { kind: ui|ctl, cols, rows }       Attached { list, dumps, flags }
-Input { id, bytes }                      Output { id, bytes }
-Resize { cols, rows }                    List { terms }            (on any change)
-Focus { id }                             Flags { id, activity, bell }
-Write { base, lines }                    Exited { id, status }
-Spawn / Kill / Rename / Save             Reply { ok | error, ... }
-Read { id, range } / Wait { id, until }
-```
+`ctl` adds connections that send requests and get replies without attaching: they aren't clients, get no output,
+and don't take the pty size. Settling that handshake (`Hello { kind: ui|ctl }` or similar) is step 4's first part.
 
 ### ctl
 
@@ -160,9 +152,11 @@ Each one ships on its own.
 1. ~~**mux**~~ (done): move terminal ownership out of `App` into `mux.rs` (list, spawn, kill, reconcile, io, flags, events).
    `App` uses it in-process. No behavior change.
 2. ~~**3-way diff**~~ (done) in `listdiff`, and `Buffer::rebase` for the staged list on list changes.
-3. **server/client**: `vix --server`, attach via dump + stream, detach on hangup and `:qd`. Detailed in server.md.
+3. ~~**server/client**~~ (done): `vix --server`, attach via dump + stream, detach on hangup and `:qd`, `-a`, `-l`.
+   Detailed in server.md.
 4. **ctl**: ls, new, kill, rename, send, read, wait, apply, save.
-5. **sessions are workflows**: `vix web` attaches or starts, `vix -d web` starts detached.
+5. **sessions are workflows**: `vix web` attaching or starting shipped in step 3. Left: `vix -d web` starts
+   detached, and `:w name` renames the session it saves.
 6. **shell integration**: OSC 133, `run`, `wait --prompt`, prompt jumps, running command in the list.
 
 ## view n editing (open)
@@ -197,7 +191,10 @@ Rust. Pure modules first, I/O at the edges.
 | `render` / `input` | io | ratatui drawing; stdin incl. kitty `CSI u` and SGR mouse |
 | `config` / `session` / `workflow` | io | config.toml, `--resume`, workflow files |
 | `mux` | io | the running list: terminals, spawn / kill / reconcile, output -> flags |
-| `server` / `client` / `ctl` | io | next: socket, attach, thin ctl client |
+| `protocol` | pure | the messages between client and server |
+| `server` / `outbox` | io | `vix --server`: owns the `Mux`, serves clients, one bounded writer per client |
+| `client` / `sock` | io | the remote list and vt replicas; socket paths, starting servers, `-l` |
+| `ctl` | io | next: thin client for scripts and agents |
 
 vix is a multiplexer, not an emulator: it runs inside ghostty/kitty/etc. like tmux, and keeps a vt parser per pty
 only to know what's on screen.
@@ -205,8 +202,8 @@ only to know what's on screen.
 ## decided
 
 - bare `vix` starts a new session; `vix name` attaches or starts the workflow's session
-- every way of quitting vix (`:qa`, `:q` from the list) kills the session, as today. Detaching is its own command
-  (name open: `:qd`? `:xd`?), plus hangup of the outer terminal
+- every way of quitting vix (`:qa`, `:q` from the list) kills the session, as today. Detaching is its own command,
+  `:qd` / `:detach`, plus hangup of the outer terminal
 - `vix ctl <verb>`, kept compartmentalized until its use is clearer
 
 ## open questions

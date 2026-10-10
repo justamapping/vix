@@ -162,7 +162,7 @@ enum Reply {                                       // server -> client
     Resized { cols: u16, rows: u16 },
     Exited { id: u64 },                            // "logs exited", then a List
     Message { text: String },                      // errors, "web" 3 terminals written
-    Info { name: String, terms: usize, clients: usize },
+    Info { name: String, terms: usize, clients: usize, since: u64 },   // since: last detach, unix ms
     Bye { reason: String },                        // killed, version mismatch
 }
 
@@ -297,7 +297,7 @@ Step 3 is done.
 - **Output floods.** `yes` in one terminal pushes a lot of JSON. Measured in 3g: about 7% over a bare pty, which
   is the bottleneck.
 - **Upgrading vix while a session runs.** The old server and new client mismatch. The version check refuses with
-  "session web runs an older vix, kill it or use that binary". tmux has the same problem.
+  "session web runs vix protocol 3, this vix 4: kill it or use that binary". tmux has the same problem.
 - **Server crashes.** The server has no screen, so it logs to `$XDG_STATE_HOME/vix/<name>.log`. When the socket
   closes unexpectedly, the client restores the terminal and prints `[server exited, see <log>]`. The shells
   surviving a client crash is a strict improvement on today.
