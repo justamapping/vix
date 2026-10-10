@@ -166,6 +166,8 @@ means a snapshot. Current lean: an edit operator (`d c x p`) freezes view n into
 bar). While frozen, `i a` edit text instead of going to the program; `:e!` returns to live. `:w file`, `:w !cmd`.
 Needs text objects (`iw iW i" ip`), `% { } * # .`, `<C-v>` first; those matter for yanking from output anyway.
 
+the main objective for this is editing a terminal prompt with vim motions and more
+
 ## vim scope
 
 All valid text **motions** should exist in every buffer (list, view n, snapshot). Operators, registers, and ex
@@ -217,3 +219,13 @@ only to know what's on screen.
 - vt parser: `vt100` until fidelity breaks (claude code, nvim), then `alacritty_terminal`
 - `/` from the list: names only, or scrollback across all terminals into the picker?
 - restrict names so the rest of the line is free for annotations (`web  # dev server`)?
+
+## concepts
+agents or people can get a suite of commands that let you drive and read vix
+vix read {workspace} {name} # read contents of a terminal
+vix append {workspace} {name} {wd = .} {cmd = none} # create terminal
+vix call {workspace} {name} {cmd} # run a command in a terminal
+vix mv # concept to move a workspace to another computer
+vix remote # concept to orchestrate remote terminals instead of driving it inside them, now you can orchestrate multiple remote sessions from one central computer
+vix workflows # list workflows to update or delete 
+vix kill {detached id}
