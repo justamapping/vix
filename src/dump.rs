@@ -19,7 +19,6 @@ pub fn dump(parser: &mut Parser) -> Vec<u8> {
 
 /// Bytes that turn a fresh parser of the same size into this one: scrollback, both screens, cursor, and modes.
 /// vt100 hides the scroll region, origin mode, and saved cursor, so those are lost until the program redraws.
-#[allow(dead_code)] // the server sends it on attach, step 3d
 pub fn exact(parser: &mut Parser) -> Vec<u8> {
     let alt = parser.screen().alternate_screen();
     if alt {

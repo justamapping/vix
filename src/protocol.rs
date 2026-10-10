@@ -12,7 +12,7 @@ use crate::motion::Pos;
 use crate::session::{Saved, Session};
 
 /// Bump on any change to these types; client and server refuse to talk across versions.
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2;
 
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -30,13 +30,15 @@ pub enum Request {
     Spawn { name: String, from: Option<u64> },
     Kill { id: u64 },
     Rename { id: u64, name: String },
-    Save { workflow: Option<String> },
+    /// `cursor` is the asker's list row, saved with the workflow
+    Save { workflow: Option<String>, cursor: usize },
     /// fresh cwds, for the picker
     Refresh,
     /// `vix -l`, without attaching
     Info,
     Detach,
-    KillSession,
+    /// `:qa`; `cursor` is the asker's list row, for `--resume`
+    KillSession { cursor: usize },
 }
 
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
@@ -182,11 +184,11 @@ mod tests {
             Request::Spawn { name: "logs".into(), from: Some(1) },
             Request::Kill { id: 1 },
             Request::Rename { id: 1, name: "tail".into() },
-            Request::Save { workflow: Some("demo".into()) },
+            Request::Save { workflow: Some("demo".into()), cursor: 1 },
             Request::Refresh,
             Request::Info,
             Request::Detach,
-            Request::KillSession,
+            Request::KillSession { cursor: 0 },
         ]);
     }
 

@@ -97,6 +97,21 @@ impl Picker {
     pub fn remove(&mut self, id: u64) {
         let selected = self.selection();
         self.items.retain(|i| i.id != id);
+        self.rerank(selected);
+    }
+
+    /// Updates directories that came in while picking, keeping the selection.
+    pub fn cwds(&mut self, cwd: impl Fn(u64) -> Option<String>) {
+        let selected = self.selection();
+        for item in &mut self.items {
+            if let Some(c) = cwd(item.id) {
+                item.cwd = c;
+            }
+        }
+        self.rerank(selected);
+    }
+
+    fn rerank(&mut self, selected: Option<u64>) {
         self.rank();
         self.selected = selected.and_then(|s| self.matches.iter().position(|m| self.items[m.item].id == s)).unwrap_or(0);
     }
@@ -229,5 +244,19 @@ mod tests {
         assert_eq!(p.selection(), Some(20));
         p.remove(20);
         assert_eq!(p.selection(), Some(10));
+    }
+
+    #[test]
+    fn cwds_rematch_keeping_the_selection() {
+        let mut p = picker(TERMS);
+        p.key(Key::Ctrl('n'));
+        let selected = p.selection();
+        p.cwds(|id| (id == 0).then(|| "~/moved".to_string()));
+        assert_eq!(p.items[0].cwd, "~/moved");
+        assert_eq!(p.selection(), selected);
+        p.key(Key::Char('m'));
+        p.key(Key::Char('o'));
+        p.key(Key::Char('v'));
+        assert_eq!(p.selection(), Some(0));
     }
 }

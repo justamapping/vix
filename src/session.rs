@@ -48,15 +48,11 @@ impl Saved {
     }
 }
 
-pub fn save(session: &Session) -> Result<()> {
-    save_to(&path().context("no $HOME")?, session)
-}
-
 pub fn load() -> Result<Session> {
     load_from(&path().context("no $HOME")?)
 }
 
-fn save_to(path: &Path, session: &Session) -> Result<()> {
+pub fn save_to(path: &Path, session: &Session) -> Result<()> {
     let dir = path.with_extension("");
     match std::fs::remove_dir_all(&dir) {
         Err(e) if e.kind() != ErrorKind::NotFound => return Err(e.into()),

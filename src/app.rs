@@ -1,4 +1,5 @@
 use std::io::{self, ErrorKind, Read, Write};
+use std::os::unix::net::UnixStream;
 use std::sync::mpsc::Sender;
 use std::thread;
 use std::time::Instant;
@@ -7,16 +8,16 @@ use anyhow::Result;
 use ratatui::DefaultTerminal;
 
 use crate::buffer::{self, Buffer, Effect, Line};
-use crate::carry;
+use crate::client::{self, Remote, Term};
 use crate::config::Config;
 use crate::follow;
 use crate::input::{self, Input, Key, Mouse, MouseKind};
 use crate::listdiff;
 use crate::motion::Pos;
-use crate::mux::{Mux, Term};
 use crate::picker::{Item, Pick, Picker};
+use crate::protocol::{List, Reply, Request, Start};
 use crate::render::{self, Bar};
-use crate::session::{Saved, Session};
+use crate::sock;
 use crate::state::{self, View};
 use crate::status::{Entry, Info, Kind, Seg};
 use crate::vt::{self, Modes};
@@ -24,14 +25,17 @@ use crate::workflow;
 
 pub enum Event {
     Input(Vec<u8>),
-    Output(u64, Vec<u8>),
-    Exited(u64),
+    Reply(Reply),
+    /// the server hung up without saying bye
+    Gone,
     Hangup,
     Resize,
 }
 
 pub struct App {
-    mux: Mux,
+    remote: Remote,
+    /// the session's name
+    name: String,
     list: Buffer,
     /// view n's read-only buffer over the viewed terminal's text
     normal: Buffer,
@@ -53,16 +57,22 @@ pub struct App {
     confirm: Option<usize>,
     /// `<C-p>`'s fuzzy finder, drawn over the terminal it has selected
     picker: Option<Picker>,
-    /// the workflow `:w` also saves to, once the list has one
-    workflow: Option<String>,
+    /// `:w`s sent whose list hasn't come back, which replaces the list buffer's edits rather than rebasing them
+    writing: usize,
+    /// what the server was last told this client views
+    focused: Option<u64>,
+    /// this client asked for `:qa`
+    killing: bool,
     config: Config,
     /// when a partly typed mapping gives up waiting
     pub deadline: Option<Instant>,
     pub quit: bool,
+    /// printed once the screen is restored, like `[detached from 0]`
+    pub farewell: Option<String>,
 }
 
 /// Forwards everything `src` reads as events until EOF.
-pub fn pump(mut src: impl Read + Send + 'static, tx: Sender<Event>, wrap: impl Fn(Vec<u8>) -> Event + Send + 'static, end: Event) {
+pub fn pump<E: Send + 'static>(mut src: impl Read + Send + 'static, tx: Sender<E>, wrap: impl Fn(Vec<u8>) -> E + Send + 'static, end: E) {
     thread::spawn(move || {
         let mut buf = [0u8; 8192];
         loop {
@@ -82,8 +92,11 @@ pub fn pump(mut src: impl Read + Send + 'static, tx: Sender<Event>, wrap: impl F
 }
 
 impl App {
-    pub fn new(tx: Sender<Event>, cols: u16, rows: u16, config: Config, session: Session, workflow: Option<String>) -> Result<Self> {
-        let cwd = std::env::current_dir()?;
+    /// Attaches to session `name` on `stream`, starting it from `start` if it's new.
+    pub fn new(tx: Sender<Event>, stream: UnixStream, name: String, cols: u16, rows: u16, config: Config, start: Option<Start>) -> Result<Self> {
+        let cursor = start.as_ref().map_or(0, |s| s.cursor);
+        let (remote, focus, reader) = Remote::attach(stream, cols, term_rows(&config, rows), start)?;
+        client::listen(reader, tx, Event::Reply, Event::Gone);
         let mut normal = Buffer::new(Vec::new());
         normal.readonly = true;
         normal.maps = config.view.clone();
@@ -91,7 +104,8 @@ impl App {
         list.maps = config.list.clone();
         list.insert_maps = config.list_insert.clone();
         let mut app = Self {
-            mux: Mux::new(tx, cols, rows, cwd.clone()),
+            remote,
+            name,
             list,
             normal,
             view: View::List,
@@ -106,60 +120,38 @@ impl App {
             alt: None,
             confirm: None,
             picker: None,
-            workflow,
+            writing: 0,
+            focused: None,
+            killing: false,
             config,
             deadline: None,
             quit: false,
+            farewell: None,
         };
         app.size_buffers();
-        app.mux.resize(cols, app.term_rows())?;
-        let mut saved = session.terms;
-        if saved.is_empty() {
-            saved.push(Saved::new("Untitled", cwd.clone()));
-        }
-        for mut s in saved {
-            if !s.cwd.is_dir() {
-                s.cwd = cwd.clone();
-            }
-            app.mux.spawn(s)?;
-        }
         app.list.load(app.lines());
-        app.list.place((session.cursor, 0), 0);
+        // a reattach lands where this session was last looked at
+        let cursor = focus.and_then(|id| app.remote.position(id)).unwrap_or(cursor);
+        app.list.place((cursor, 0), 0);
+        if let Some(id) = focus {
+            app.set_view(View::Insert(id));
+        }
+        app.tell_focus();
         Ok(app)
     }
 
-    /// The list's names, directories, and commands, without output.
-    fn session(&self) -> Session {
-        Session { cursor: self.cursor(), terms: self.mux.saved() }
-    }
-
-    /// The list row of the viewed or last viewed terminal.
+    /// The list row of the viewed or last viewed terminal, saved with workflows and `--resume`'s snapshot.
     fn cursor(&self) -> usize {
-        let at = self.viewing().or(self.last).and_then(|id| self.mux.position(id));
+        let at = self.viewing().or(self.last).and_then(|id| self.remote.position(id));
         at.unwrap_or(self.list.cursor.0)
-    }
-
-    /// The list as `--resume` will bring it back.
-    pub fn snapshot(&mut self) -> Session {
-        Session { cursor: self.cursor(), terms: self.mux.dumped() }
-    }
-
-    /// Saves the list as workflow `name`, which `:w` then keeps saving to.
-    fn save_workflow(&mut self, name: String) {
-        self.list.message = Some(match workflow::save(&name, self.session()) {
-            Ok(()) => format!("\"{name}\" {} terminals written", self.mux.len()),
-            Err(e) => format!("{e:#}"),
-        });
-        self.workflow = Some(name);
     }
 
     pub fn message(&mut self, msg: String) {
         self.list.message = Some(msg);
     }
 
-    /// The bar takes a row from every terminal, so ptys keep their size across views.
     fn term_rows(&self) -> u16 {
-        if self.config.status.enabled { self.rows.saturating_sub(1).max(1) } else { self.rows }
+        term_rows(&self.config, self.rows)
     }
 
     fn size_buffers(&mut self) {
@@ -168,15 +160,15 @@ impl App {
     }
 
     fn lines(&self) -> Vec<Line> {
-        self.mux.terms().iter().map(|t| Line { id: Some(t.id), text: t.name.clone() }).collect()
+        self.remote.terms().iter().map(|t| Line { id: Some(t.id), text: t.name.clone() }).collect()
     }
 
     fn term(&mut self, id: u64) -> Option<&mut Term> {
-        self.mux.get_mut(id)
+        self.remote.get_mut(id)
     }
 
     fn alive(&self, id: u64) -> bool {
-        self.mux.alive(id)
+        self.remote.alive(id)
     }
 
     fn viewing(&self) -> Option<u64> {
@@ -230,46 +222,59 @@ impl App {
         self.normal.refresh(lines);
     }
 
-    pub fn kill_all(&mut self) {
-        self.mux.kill_all();
+    /// A new list from the server. Terminals that are gone leave the list even if they have edits; `open` is one this
+    /// client asked to open.
+    fn listed(&mut self, list: List) {
+        for t in self.remote.sync(&list) {
+            if let Some(p) = &mut self.picker {
+                p.remove(t.id);
+            }
+            if self.viewing() == Some(t.id) {
+                self.go_list(t.id);
+            }
+        }
+        if self.writing > 0 {
+            self.writing -= 1;
+            self.list.load(self.lines());
+        } else {
+            self.list.rebase(self.lines());
+        }
+        if let Some(p) = &mut self.picker {
+            p.cwds(|id| self.remote.get(id).map(|t| workflow::tilde(&t.cwd)));
+        }
+        if list.open.is_some() {
+            self.open(list.open);
+        }
     }
 
-    /// Forgets a terminal that exited or was killed; its lines leave the list even if it has edits.
-    fn remove(&mut self, id: u64) -> Option<Term> {
-        let t = self.mux.remove(id)?;
-        if let Some(p) = &mut self.picker {
-            p.remove(id);
+    /// Tells the server what this client views, so it isn't flagged.
+    fn tell_focus(&mut self) {
+        let viewing = self.viewing();
+        if self.focused != viewing {
+            self.focused = viewing;
+            self.remote.send(&Request::Focus { id: viewing });
         }
-        if self.viewing() == Some(id) {
-            self.go_list(id);
-        }
-        self.list.rebase(self.lines());
-        Some(t)
     }
 
     /// Applies one event. Returns whether the screen needs a redraw.
     pub fn handle(&mut self, event: Event) -> Result<bool> {
+        let redraw = self.apply(event)?;
+        self.tell_focus();
+        Ok(redraw)
+    }
+
+    fn apply(&mut self, event: Event) -> Result<bool> {
         match event {
-            Event::Output(id, bytes) => {
-                let normal = self.view == View::Normal(id);
-                let viewed = self.viewing() == Some(id);
-                let Some(t) = self.term(id) else { return Ok(false) };
-                let before = follow::live(t.vt.screen_mut());
-                let flagged = t.feed(&bytes, viewed)?;
-                let after = follow::live(t.vt.screen_mut());
-                if normal {
-                    self.stale = true;
-                    if self.normal.mode == buffer::Mode::Normal {
-                        (self.normal.cursor, self.normal.top) = follow::follow(self.normal.cursor, self.normal.top, before, after);
-                    }
+            Event::Reply(reply) => Ok(self.reply(reply)),
+            Event::Gone => {
+                if !self.quit {
+                    self.quit = true;
+                    let log = sock::log(&self.name).map_or_else(|e| e.to_string(), |p| p.display().to_string());
+                    self.farewell = Some(format!("[lost session {}, see {log}]", self.name));
                 }
-                Ok(viewed || (flagged && self.config.status.enabled))
+                Ok(false)
             }
-            Event::Exited(id) => {
-                let Some(t) = self.remove(id) else { return Ok(false) };
-                self.list.message = Some(format!("{} exited", t.name));
-                Ok(true)
-            }
+            // the session keeps running, as with :qd
             Event::Hangup => {
                 self.quit = true;
                 Ok(false)
@@ -279,10 +284,7 @@ impl App {
                 let (cols, rows) = crossterm::terminal::size()?;
                 (self.cols, self.rows) = (cols, rows);
                 self.size_buffers();
-                self.mux.resize(cols, self.term_rows())?;
-                if let View::Normal(id) = self.view {
-                    self.enter_normal(id);
-                }
+                self.remote.send(&Request::Resize { cols, rows: self.term_rows() });
                 Ok(true)
             }
             Event::Input(bytes) => {
@@ -308,20 +310,80 @@ impl App {
         }
     }
 
+    /// Applies what the server sent. Returns whether the screen needs a redraw.
+    fn reply(&mut self, reply: Reply) -> bool {
+        match reply {
+            Reply::Output { id, bytes } => {
+                let normal = self.view == View::Normal(id);
+                let viewed = self.viewing() == Some(id);
+                let Some(t) = self.term(id) else { return false };
+                let before = follow::live(t.vt.screen_mut());
+                t.feed(&bytes);
+                let after = follow::live(t.vt.screen_mut());
+                if normal {
+                    self.stale = true;
+                    if self.normal.mode == buffer::Mode::Normal {
+                        (self.normal.cursor, self.normal.top) = follow::follow(self.normal.cursor, self.normal.top, before, after);
+                    }
+                }
+                viewed
+            }
+            Reply::Flags { id, activity, bell } => {
+                let Some(t) = self.term(id) else { return false };
+                (t.activity, t.bell) = (activity, bell);
+                self.config.status.enabled
+            }
+            Reply::List(list) => {
+                self.listed(list);
+                true
+            }
+            Reply::Exited { id } => {
+                let Some(t) = self.remote.get(id) else { return false };
+                self.list.message = Some(format!("{} exited", t.name));
+                true
+            }
+            Reply::Resized { cols, rows } => {
+                self.remote.resized(cols, rows);
+                if let View::Normal(id) = self.view {
+                    self.enter_normal(id);
+                }
+                true
+            }
+            Reply::Message { text } => {
+                let buf = if matches!(self.view, View::Normal(_)) { &mut self.normal } else { &mut self.list };
+                buf.message = Some(text);
+                true
+            }
+            Reply::Bye { reason } => {
+                self.quit = true;
+                self.farewell = match reason.as_str() {
+                    "killed" if self.killing => None,
+                    "killed" => Some(format!("[session {} killed]", self.name)),
+                    "detached" => Some(format!("[detached from {}]", self.name)),
+                    _ => Some(format!("[{reason}]")),
+                };
+                false
+            }
+            Reply::Attached { .. } | Reply::Info { .. } => false,
+        }
+    }
+
     /// The mapping timeout passed: run the keys it was holding.
     pub fn flush(&mut self) -> Result<()> {
         self.deadline = None;
         match self.view {
             View::List => {
                 let effects = self.list.flush();
-                self.list_effects(effects)
+                self.list_effects(effects)?;
             }
             View::Normal(id) => {
                 let effects = self.normal.flush();
-                self.normal_effects(id, effects)
+                self.normal_effects(id, effects)?;
             }
-            View::Insert(_) => Ok(()),
+            View::Insert(_) => {}
         }
+        self.tell_focus();
+        Ok(())
     }
 
     fn input(&mut self, input: Input) -> Result<()> {
@@ -332,10 +394,8 @@ impl App {
             (_, Input::Mouse(m)) => return self.mouse(m),
             (View::Insert(id), input) => {
                 let (next, out) = state::step(self.view, input, self.config.escape);
-                if let Some(t) = self.term(id)
-                    && !out.is_empty()
-                {
-                    t.write(&out)?;
+                if !out.is_empty() {
+                    self.remote.input(id, out);
                 }
                 if next == View::Normal(id) {
                     self.enter_normal(id);
@@ -346,9 +406,7 @@ impl App {
             (View::Normal(id), Input::Escape) => {
                 if std::mem::take(&mut self.fresh) {
                     let (next, out) = state::step(self.view, Input::Escape, self.config.escape);
-                    if let Some(t) = self.term(id) {
-                        t.write(&out)?;
-                    }
+                    self.remote.input(id, out);
                     self.set_view(next);
                 }
                 return Ok(());
@@ -374,21 +432,23 @@ impl App {
         Ok(())
     }
 
-    /// Opens the picker, the alternate terminal first so `<C-p><CR>` acts like `<C-^>`.
+    /// Opens the picker, the alternate terminal first so `<C-p><CR>` acts like `<C-^>`. Directories update once the
+    /// server sends fresh ones.
     fn pick(&mut self) {
         let alternate = if self.viewing().is_some() { self.alt } else { self.last };
         let mut items: Vec<Item> = self
-            .mux
+            .remote
             .terms()
             .iter()
             .enumerate()
-            .map(|(i, t)| Item { id: t.id, index: i + 1, name: t.name.clone(), cwd: workflow::tilde(&t.cwd()) })
+            .map(|(i, t)| Item { id: t.id, index: i + 1, name: t.name.clone(), cwd: workflow::tilde(&t.cwd) })
             .collect();
         if let Some(i) = items.iter().position(|item| Some(item.id) == alternate) {
             let item = items.remove(i);
             items.insert(0, item);
         }
         self.picker = Some(Picker::new(items));
+        self.remote.send(&Request::Refresh);
     }
 
     fn picker_input(&mut self, input: Input) -> Result<()> {
@@ -434,16 +494,17 @@ impl App {
                 }
                 Effect::Parent | Effect::Quit { force: false } => self.go_list(id),
                 Effect::Quit { force: true } => {
-                    if let Some(mut t) = self.remove(id) {
-                        t.kill();
-                        self.list.message = Some(format!("{} killed", t.name));
+                    if let Some(name) = self.kill(id) {
+                        self.go_list(id);
+                        self.list.message = Some(format!("{name} killed"));
                     }
                 }
                 Effect::QuitAll { force } => self.quit_all(force, true),
+                Effect::Detach { force } => self.detach(force, true),
                 Effect::Switch(n) => {
-                    let i = self.mux.position(id).unwrap_or(0) as isize;
-                    let j = (i + n).clamp(0, self.mux.len() as isize - 1) as usize;
-                    let next = self.mux.terms()[j].id;
+                    let i = self.remote.position(id).unwrap_or(0) as isize;
+                    let j = (i + n).clamp(0, self.remote.len() as isize - 1) as usize;
+                    let next = self.remote.terms()[j].id;
                     if next != id {
                         self.enter_normal(next);
                     }
@@ -462,8 +523,8 @@ impl App {
                     self.refresh_normal();
                 }
                 Effect::Edit { name, new } => self.edit(name, new, Some(id)),
-                Effect::Goto(n) => match state::goto(n, self.mux.len()) {
-                    Some(i) => self.enter_normal(self.mux.terms()[i].id),
+                Effect::Goto(n) => match state::goto(n, self.remote.len()) {
+                    Some(i) => self.enter_normal(self.remote.terms()[i].id),
                     None => self.normal.message = Some(format!("no terminal {n}")),
                 },
                 Effect::Pick => self.pick(),
@@ -476,23 +537,23 @@ impl App {
     }
 
     /// Moves a line editor's cursor to where `i a I A` asked, when that's on its line; anywhere else it stays put.
-    fn carry(&mut self, id: u64, (row, index): Pos) -> Result<()> {
-        let Some(t) = self.term(id) else { return Ok(()) };
-        if !t.raw() {
-            return Ok(());
-        }
-        let Some(row) = row.checked_sub(vt::history(t.vt.screen_mut())) else { return Ok(()) };
-        if let Some(keys) = carry::arrows(t.vt.screen(), row as u16, index) {
-            t.write(&keys)?;
-        }
+    fn carry(&mut self, id: u64, at: Pos) -> Result<()> {
+        self.remote.send(&Request::Carry { id, at });
         Ok(())
+    }
+
+    /// Asks the server to kill `id`. Returns its name; the list drops it once the server sends the next one.
+    fn kill(&mut self, id: u64) -> Option<String> {
+        let name = self.remote.get(id)?.name.clone();
+        self.remote.send(&Request::Kill { id });
+        Some(name)
     }
 
     /// `:d [name]` from view n on `id`. Deleting the viewed terminal moves on to the alternate or a neighbor, like `:bd`.
     fn delete(&mut self, id: u64, name: Option<String>) {
         let target = match &name {
             None => id,
-            Some(name) => match self.mux.terms().iter().find(|t| &t.name == name) {
+            Some(name) => match self.remote.terms().iter().find(|t| &t.name == name) {
                 Some(t) => t.id,
                 None => {
                     self.normal.message = Some(format!("E94: No matching terminal for {name}"));
@@ -501,9 +562,8 @@ impl App {
             },
         };
         let next = if target == id { self.successor(id) } else { Some(id) };
-        let Some(mut t) = self.remove(target) else { return };
-        t.kill();
-        let msg = format!("{} killed", t.name);
+        let Some(killed) = self.kill(target) else { return };
+        let msg = format!("{killed} killed");
         match next {
             Some(next) if next != id => {
                 self.enter_normal(next);
@@ -519,31 +579,25 @@ impl App {
         if let Some(alt) = self.alt.filter(|a| *a != id && self.alive(*a)) {
             return Some(alt);
         }
-        let terms = self.mux.terms();
-        let i = self.mux.position(id)?;
+        let terms = self.remote.terms();
+        let i = self.remote.position(id)?;
         terms.get(i + 1).or(i.checked_sub(1).and_then(|j| terms.get(j))).map(|t| t.id)
     }
 
     /// `:r name` from view n on `id`.
     fn rename(&mut self, id: u64, name: String) {
-        if self.mux.rename(id, name).is_some() {
-            self.list.rebase(self.lines());
-        }
+        self.remote.send(&Request::Rename { id, name });
     }
 
     /// The program in view i asked for the mouse, so events go to it as they are.
     fn program_mouse(&self, id: u64) -> bool {
-        !self.config.mouse || self.mux.get(id).is_some_and(|t| vt::modes(&t.vt).mouse != 0)
+        !self.config.mouse || self.remote.get(id).is_some_and(|t| vt::modes(&t.vt).mouse != 0)
     }
 
     fn mouse(&mut self, m: Mouse) -> Result<()> {
         let kind = m.kind();
         match self.view {
-            View::Insert(id) if self.program_mouse(id) => {
-                if let Some(t) = self.term(id) {
-                    t.write(&m.encode())?;
-                }
-            }
+            View::Insert(id) if self.program_mouse(id) => self.remote.input(id, m.encode()),
             View::Insert(id) => self.insert_mouse(id, m, kind)?,
             View::Normal(id) => match kind {
                 MouseKind::WheelUp | MouseKind::WheelDown => {
@@ -587,7 +641,7 @@ impl App {
                     (true, true) => "\x1bOA",
                     (false, true) => "\x1bOB",
                 };
-                t.write(arrow.repeat(buffer::WHEEL).as_bytes())?;
+                self.remote.input(id, arrow.repeat(buffer::WHEEL).into_bytes());
             }
             MouseKind::WheelUp if vt::history(t.vt.screen_mut()) > 0 => {
                 self.enter_normal(id);
@@ -608,20 +662,41 @@ impl App {
     }
 
     fn quit_all(&mut self, force: bool, from_normal: bool) {
-        if force || !self.list.modified() {
-            self.quit = true;
+        if self.unsaved(force, from_normal) {
             return;
+        }
+        self.kill_session();
+    }
+
+    /// `:qa` and `:q` from the list end the session for every client. The server saves `--resume`'s snapshot, then
+    /// says bye.
+    fn kill_session(&mut self) {
+        self.killing = true;
+        self.remote.send(&Request::KillSession { cursor: self.cursor() });
+    }
+
+    /// `:qd` leaves the session running. Staged list edits live here, so they'd be lost.
+    fn detach(&mut self, force: bool, from_normal: bool) {
+        if !self.unsaved(force, from_normal) {
+            self.remote.send(&Request::Detach);
+        }
+    }
+
+    /// Refuses with E37 when the list has edits, unless forced.
+    fn unsaved(&mut self, force: bool, from_normal: bool) -> bool {
+        if force || !self.list.modified() {
+            return false;
         }
         let msg = Some("E37: No write since last change (add ! to override)".into());
         if from_normal { self.normal.message = msg } else { self.list.message = msg }
+        true
     }
 
     fn list_key(&mut self, key: Key) -> Result<()> {
         if let Some(row) = self.confirm.take() {
             self.list.message = None;
             if key == Key::Char('y') {
-                let ids = self.write();
-                self.open(ids.get(row).copied().flatten());
+                self.write_open(row);
             }
             return Ok(());
         }
@@ -634,26 +709,28 @@ impl App {
             match effect {
                 Effect::Open(row) => {
                     let summary = self.pending_summary();
-                    if summary.is_empty() {
-                        let ids = if self.list.modified() { self.write() } else { self.list.lines.iter().map(|l| l.id).collect() };
-                        self.open(ids.get(row).copied().flatten());
-                    } else {
+                    if !summary.is_empty() {
                         self.list.message = Some(format!("{summary}. write? [y/n]"));
                         self.confirm = Some(row);
+                    } else if self.list.modified() {
+                        self.write_open(row);
+                    } else {
+                        self.open(self.list.lines.get(row).and_then(|l| l.id));
                     }
                 }
                 Effect::Write => {
-                    self.write();
-                    if let Some(name) = self.workflow.clone() {
-                        self.save_workflow(name);
+                    self.write(None);
+                    if self.remote.workflow.is_some() {
+                        self.remote.send(&Request::Save { workflow: None, cursor: self.cursor() });
                     }
                 }
                 Effect::Save(name) => {
-                    self.write();
-                    self.save_workflow(name);
+                    self.write(None);
+                    self.remote.send(&Request::Save { workflow: Some(name), cursor: self.cursor() });
                 }
-                Effect::Quit { .. } => self.quit = true,
+                Effect::Quit { .. } => self.kill_session(),
                 Effect::QuitAll { force } => self.quit_all(force, false),
+                Effect::Detach { force } => self.detach(force, false),
                 Effect::Reload => self.list.load(self.lines()),
                 Effect::Edit { name, new } => self.edit(name, new, None),
                 Effect::Pick => self.pick(),
@@ -663,23 +740,14 @@ impl App {
         Ok(())
     }
 
-    /// `:e name` / `:new name`: views the terminal called `name`, or spawns it at the end of the list in `from`'s directory.
+    /// `:e name` / `:new name`: views the terminal called `name`, or spawns it at the end of the list in `from`'s
+    /// directory, opened once the server sends the list with it.
     fn edit(&mut self, name: String, new: bool, from: Option<u64>) {
-        if let Some(id) = self.mux.terms().iter().find(|t| !new && t.name == name).map(|t| t.id) {
+        if let Some(id) = self.remote.terms().iter().find(|t| !new && t.name == name).map(|t| t.id) {
             self.set_view(View::Insert(id));
             return;
         }
-        let cwd = from.and_then(|id| self.mux.get(id)).map_or(self.mux.cwd.clone(), Term::cwd);
-        match self.mux.spawn(Saved::new(name.clone(), cwd)) {
-            Ok(id) => {
-                self.list.rebase(self.lines());
-                self.set_view(View::Insert(id));
-            }
-            Err(e) => {
-                let buf = if from.is_some() { &mut self.normal } else { &mut self.list };
-                buf.message = Some(format!("spawn failed: {e}"));
-            }
-        }
+        self.remote.send(&Request::Spawn { name, from });
     }
 
     fn open(&mut self, id: Option<u64>) {
@@ -698,21 +766,24 @@ impl App {
     }
 
     fn current(&self) -> Vec<(u64, &str)> {
-        self.mux.terms().iter().map(|t| (t.id, t.name.as_str())).collect()
+        self.remote.terms().iter().map(|t| (t.id, t.name.as_str())).collect()
     }
 
-    /// `:w`: reconcile running terminals with the list buffer. Returns the id each old list line ended up with.
-    fn write(&mut self) -> Vec<Option<u64>> {
-        let ops = listdiff::diff(&self.list.base(), &self.current(), &self.list.lines);
-        let (placed, errors) = self.mux.reconcile(ops);
-        // ops came in non-blank line order
-        let mut placed = placed.into_iter();
-        let ids = self.list.lines.iter().map(|l| if l.text.trim().is_empty() { None } else { placed.next().flatten() }).collect();
-        self.list.load(self.lines());
-        if let Some(e) = errors.first() {
-            self.list.message = Some(format!("spawn failed: {e}"));
+    /// `:w`: the server reconciles running terminals with the list buffer and sends the list back, opening the
+    /// terminal on row `open`. Edits count as written once sent.
+    fn write(&mut self, open: Option<usize>) {
+        self.writing += 1;
+        self.remote.send(&Request::Write { base: self.list.base(), lines: self.list.lines.clone(), open });
+        self.list.refresh(self.list.lines.clone());
+    }
+
+    /// Writes, then opens row `row`'s terminal, which a blank row doesn't have.
+    fn write_open(&mut self, row: usize) {
+        let blank = self.list.lines.get(row).is_none_or(|l| l.text.trim().is_empty());
+        self.write((!blank).then_some(row));
+        if blank {
+            self.open(None);
         }
-        ids
     }
 
     /// The bottom row's status. Without the bar the list still shows its mode and `[+]`, as before.
@@ -726,7 +797,7 @@ impl App {
         let viewing = self.viewing();
         let alternate = if viewing.is_some() { self.alt } else { self.last };
         let terms = self
-            .mux
+            .remote
             .terms()
             .iter()
             .map(|t| Entry {
@@ -742,7 +813,7 @@ impl App {
             View::Normal(_) => self.normal.mode.label(),
             View::Insert(_) => "-- TERMINAL --",
         };
-        let workflow = self.workflow.as_deref().unwrap_or_default();
+        let workflow = self.remote.workflow.as_deref().unwrap_or_default();
         let info = Info { mode, modified: self.list.modified(), workflow, terms };
         Some(Bar { left: status.left.expand(&info), right: status.right.expand(&info) })
     }
@@ -761,7 +832,7 @@ impl App {
         if let Some(p) = &self.picker {
             // typing keeps what you were looking at; moving the selection previews it
             let shown = if p.browsing { p.selection() } else { self.viewing() };
-            let preview = shown.and_then(|id| self.mux.get(id));
+            let preview = shown.and_then(|id| self.remote.get(id));
             terminal.draw(|f| {
                 match (preview, &bar) {
                     (Some(t), bar) => render::term(f, t.vt.screen(), None, bar.as_ref()),
@@ -782,7 +853,7 @@ impl App {
             }
             View::Normal(id) => {
                 let top = self.normal.top;
-                let t = self.mux.get_mut(id).expect("checked above");
+                let t = self.remote.get_mut(id).expect("checked above");
                 let screen = t.vt.screen_mut();
                 let total = vt::history(screen);
                 screen.set_scrollback(total.saturating_sub(top));
@@ -793,7 +864,7 @@ impl App {
                 self.mouse_modes(Modes::default())
             }
             View::Insert(id) => {
-                let t = self.mux.get(id).expect("checked above");
+                let t = self.remote.get(id).expect("checked above");
                 terminal.draw(|f| render::term(f, t.vt.screen(), None, bar.as_ref()))?;
                 let modes = vt::modes(&t.vt);
                 if modes.mouse == 0 { self.mouse_modes(modes) } else { modes }
@@ -811,6 +882,11 @@ impl App {
         }
         Ok(())
     }
+}
+
+/// The bar takes a row from every terminal, so ptys keep their size across views.
+fn term_rows(config: &Config, rows: u16) -> u16 {
+    if config.status.enabled { rows.saturating_sub(1).max(1) } else { rows }
 }
 
 /// Buffer position under screen cell (x, y), held to the visible lines.

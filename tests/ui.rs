@@ -3,6 +3,7 @@
 
 use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -34,6 +35,20 @@ impl Home {
     /// Under the real path: macOS temp dirs sit behind a symlink, and shells report where they really are.
     fn path(&self, rel: &str) -> PathBuf {
         self.0.path().canonicalize().unwrap().join(rel)
+    }
+}
+
+/// Killing a client leaves its session running, so every session started under this home is killed with it.
+impl Drop for Home {
+    fn drop(&mut self) {
+        let Ok(socks) = std::fs::read_dir(self.path("run/vix")) else { return };
+        for sock in socks.flatten() {
+            let Ok(mut stream) = UnixStream::connect(sock.path()) else { continue };
+            let _ = stream.set_read_timeout(Some(TIMEOUT));
+            let _ = stream.write_all(b"{\"type\":\"kill_session\",\"cursor\":0}\n");
+            // the server hangs up once it's done
+            let _ = stream.read_to_end(&mut Vec::new());
+        }
     }
 }
 
@@ -263,4 +278,27 @@ fn resume_restores_names_and_output() {
     assert_snapshot!("resume_list", vix.screen());
     vix.keys("\r");
     assert_snapshot!("resume_output", vix.screen());
+}
+
+#[test]
+fn detach_and_reattach_keep_the_screen() {
+    let home = Home::new();
+    let mut vix = Vix::start(&home, &["demo"]);
+    vix.keys("\r").keys("echo kept\r");
+    let before = vix.screen();
+    assert!(before.contains("$ echo kept\nkept\n$"), "{before}");
+    vix.keys("\x1c").keys(":qd\r");
+    assert!(vix.exited());
+    assert!(vix.screen().contains("[detached from demo]"), "{}", vix.screen());
+
+    // lands back in view i on what was viewed, as it was
+    let vix = Vix::start(&home, &["demo"]);
+    assert_eq!(vix.screen(), before);
+    // closing the window detaches too
+    drop(vix);
+    let mut vix = Vix::start(&home, &["demo"]);
+    assert_eq!(vix.screen(), before);
+
+    vix.keys("\x1c-").keys("oapi\x1b").keys(":qd\r");
+    assert_snapshot!("detach_refused", vix.screen());
 }

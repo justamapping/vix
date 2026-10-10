@@ -5,9 +5,12 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Error, Result};
 
-use crate::app::{Event, pump};
+use crate::app::pump;
+use crate::buffer::Line;
+use crate::carry;
 use crate::dump;
-use crate::listdiff::Op;
+use crate::listdiff::{self, Op};
+use crate::motion::Pos;
 use crate::proc;
 use crate::pty::Pty;
 use crate::session::Saved;
@@ -16,6 +19,12 @@ use crate::vt;
 // output this soon after a spawn or resize is the program starting or redrawing, not activity
 const SPAWN_QUIET: Duration = Duration::from_millis(1000);
 const RESIZE_QUIET: Duration = Duration::from_millis(250);
+
+/// What a terminal's pty tells whoever owns the `Mux`.
+pub enum PtyEvent {
+    Output(u64, Vec<u8>),
+    Exited(u64),
+}
 
 pub struct Term {
     pub id: u64,
@@ -67,6 +76,18 @@ impl Term {
         Ok((self.activity, self.bell) != flags)
     }
 
+    /// Moves a line editor's cursor to `at` (a row counting scrollback, a char index) with arrow keys, for `i a I A`.
+    pub fn carry(&mut self, (row, index): Pos) -> Result<()> {
+        if !self.raw() {
+            return Ok(());
+        }
+        let Some(row) = row.checked_sub(vt::history(self.vt.screen_mut())) else { return Ok(()) };
+        if let Some(keys) = carry::arrows(self.vt.screen(), row as u16, index) {
+            self.write(&keys)?;
+        }
+        Ok(())
+    }
+
     /// Clears activity and bell, now that it's been seen.
     pub fn seen(&mut self) {
         (self.activity, self.bell) = (false, false);
@@ -74,18 +95,18 @@ impl Term {
 }
 
 /// The running list: terminals in order, each with a pty and its parsed screen. Output and exits arrive as events.
-pub struct Mux {
+pub struct Mux<E> {
     terms: Vec<Term>,
     next_id: u64,
     cols: u16,
     rows: u16,
     /// where new terminals start when nothing else says
     pub cwd: PathBuf,
-    tx: Sender<Event>,
+    tx: Sender<E>,
 }
 
-impl Mux {
-    pub fn new(tx: Sender<Event>, cols: u16, rows: u16, cwd: PathBuf) -> Self {
+impl<E: From<PtyEvent> + Send + 'static> Mux<E> {
+    pub fn new(tx: Sender<E>, cols: u16, rows: u16, cwd: PathBuf) -> Self {
         Self { terms: Vec::new(), next_id: 0, cols, rows, cwd, tx }
     }
 
@@ -117,7 +138,7 @@ impl Mux {
         let id = self.next_id;
         self.next_id += 1;
         let pty = Pty::spawn(self.cols, self.rows, &cwd)?;
-        pump(pty.reader()?, self.tx.clone(), move |b| Event::Output(id, b), Event::Exited(id));
+        pump(pty.reader()?, self.tx.clone(), move |b| PtyEvent::Output(id, b).into(), PtyEvent::Exited(id).into());
         let vt = vt::parser(self.cols, self.rows);
         Ok(Term { id, name, cwd, cmd: None, pty, vt, activity: false, bell: false, quiet: Instant::now() + SPAWN_QUIET })
     }
@@ -134,6 +155,20 @@ impl Mux {
         let id = t.id;
         self.terms.push(t);
         Ok(id)
+    }
+
+    /// Spawns a session's terminals, or one Untitled. A directory that's gone falls back to the mux's.
+    pub fn open(&mut self, mut saved: Vec<Saved>) -> Result<()> {
+        if saved.is_empty() {
+            saved.push(Saved::new("Untitled", self.cwd.clone()));
+        }
+        for mut s in saved {
+            if !s.cwd.is_dir() {
+                s.cwd = self.cwd.clone();
+            }
+            self.spawn(s)?;
+        }
+        Ok(())
     }
 
     /// Takes a terminal out of the list without killing it, e.g. once it exited.
@@ -161,6 +196,37 @@ impl Mux {
             t.quiet = t.quiet.max(Instant::now() + RESIZE_QUIET);
         }
         Ok(())
+    }
+
+    /// Makes full-screen programs redraw, for what `dump::exact` can't copy, like scroll regions: shrinks their ptys
+    /// a row, until `fit`. Returns which. tmux does this on attach.
+    pub fn shrink(&mut self) -> Result<Vec<u64>> {
+        let mut shrunk = Vec::new();
+        for t in self.terms.iter_mut().filter(|t| t.vt.screen().alternate_screen()) {
+            t.pty.resize(self.cols, self.rows.saturating_sub(1).max(1))?;
+            t.quiet = t.quiet.max(Instant::now() + RESIZE_QUIET);
+            shrunk.push(t.id);
+        }
+        Ok(shrunk)
+    }
+
+    /// Gives shrunk ptys their size back.
+    pub fn fit(&mut self, ids: &[u64]) -> Result<()> {
+        for t in self.terms.iter_mut().filter(|t| ids.contains(&t.id)) {
+            t.pty.resize(self.cols, self.rows)?;
+        }
+        Ok(())
+    }
+
+    /// `:w` of `lines`, edited from the list `base`. Returns the id each line ended up with, and failed spawns.
+    pub fn write(&mut self, base: &[u64], lines: &[Line]) -> (Vec<Option<u64>>, Vec<Error>) {
+        let current: Vec<(u64, &str)> = self.terms.iter().map(|t| (t.id, t.name.as_str())).collect();
+        let ops = listdiff::diff(base, &current, lines);
+        let (placed, errors) = self.reconcile(ops);
+        // ops come in non-blank line order
+        let mut placed = placed.into_iter();
+        let ids = lines.iter().map(|l| if l.text.trim().is_empty() { None } else { placed.next().flatten() }).collect();
+        (ids, errors)
     }
 
     /// Applies `listdiff` ops. Returns the id each Keep/Clone/Spawn ended up with, in op order, and failed spawns.
@@ -210,6 +276,11 @@ impl Mux {
         self.terms.iter().map(|t| Saved { cmd: t.cmd.clone(), ..Saved::new(t.name.clone(), t.cwd()) }).collect()
     }
 
+    /// Each terminal's exact screen, for a client attaching.
+    pub fn exact(&mut self) -> Vec<(u64, Vec<u8>)> {
+        self.terms.iter_mut().map(|t| (t.id, dump::exact(&mut t.vt))).collect()
+    }
+
     /// `saved` with each screen and scrollback, for `--resume`.
     pub fn dumped(&mut self) -> Vec<Saved> {
         let mut saved = self.saved();
@@ -225,14 +296,14 @@ mod tests {
     use super::*;
     use std::sync::mpsc;
 
-    fn names(mux: &Mux) -> Vec<&str> {
+    fn names(mux: &Mux<PtyEvent>) -> Vec<&str> {
         mux.terms().iter().map(|t| t.name.as_str()).collect()
     }
 
     #[test]
     fn reconcile_keeps_kills_and_spawns_in_list_order() {
         let (tx, _rx) = mpsc::channel();
-        let mut mux = Mux::new(tx, 80, 24, std::env::temp_dir());
+        let mut mux: Mux<PtyEvent> = Mux::new(tx, 80, 24, std::env::temp_dir());
         let a = mux.spawn(Saved::new("a", "/")).unwrap();
         let b = mux.spawn(Saved::new("b", "/")).unwrap();
         let ops = vec![

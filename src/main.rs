@@ -1,6 +1,7 @@
 mod app;
 mod buffer;
 mod carry;
+mod client;
 mod config;
 mod dump;
 mod follow;
@@ -13,13 +14,13 @@ mod motion;
 mod mux;
 mod picker;
 mod proc;
-#[allow(dead_code)] // used by the server and client, steps 3d and 3e
 mod protocol;
 mod pty;
 mod remap;
 mod render;
+mod server;
 mod session;
-#[allow(dead_code)] // used by the server and client, steps 3d and 3e
+#[allow(dead_code)] // `-l` uses the rest, step 3f
 mod sock;
 mod state;
 mod status;
@@ -27,16 +28,18 @@ mod vt;
 mod workflow;
 
 use std::io::{self, Write};
+use std::os::unix::net::UnixStream;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::thread;
 use std::time::Instant;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use ratatui::DefaultTerminal;
 use signal_hook::consts::{SIGHUP, SIGTERM, SIGWINCH};
 use signal_hook::iterator::Signals;
 
 use app::{App, Event};
+use protocol::Start;
 use session::Session;
 
 // events handled before a redraw, so a flooding program can't starve the screen
@@ -47,9 +50,12 @@ const USAGE: &str = "usage: vix [-r | --resume] [workflow]";
 fn main() -> Result<()> {
     let mut resume = false;
     let mut name: Option<String> = None;
-    for arg in std::env::args().skip(1) {
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
         match arg.as_str() {
             "-r" | "--resume" => resume = true,
+            // started by a client, not by hand
+            "--server" => return server::run(&args.next().context("--server needs a session name")?),
             "-h" | "--help" => {
                 println!("{USAGE}");
                 return Ok(());
@@ -58,16 +64,10 @@ fn main() -> Result<()> {
             _ => name = Some(arg),
         }
     }
-    let mut new_workflow = None;
-    let session = match &name {
-        Some(_) if resume => bail!("--resume and a workflow can't be used together\n{USAGE}"),
-        Some(name) => workflow::load(name)?.unwrap_or_else(|| {
-            new_workflow = Some(format!("\"{name}\" [New]"));
-            Session::default()
-        }),
-        None if resume => session::load()?,
-        None => Session::default(),
-    };
+    if resume && name.is_some() {
+        bail!("--resume and a workflow can't be used together\n{USAGE}");
+    }
+    let (session, stream, start, new_workflow) = connect(name, resume)?;
     let (config, config_error) = config::load();
 
     let (tx, rx) = mpsc::channel();
@@ -82,18 +82,48 @@ fn main() -> Result<()> {
 
     let mut terminal = ratatui::try_init()?;
     let size = terminal.size()?;
-    let result = App::new(tx, size.width, size.height, config, session, name).and_then(|mut app| {
+    let result = App::new(tx, stream, session, size.width, size.height, config, start).and_then(|mut app| {
         if let Some(msg) = config_error.or(new_workflow) {
             app.message(msg);
         }
-        run(app, &mut terminal, rx)
+        run(&mut app, &mut terminal, rx)?;
+        Ok(app.farewell)
     });
     let _ = io::stdout().write_all(&vt::mode_bytes(vt::Modes::default()));
     ratatui::restore();
-    result
+    if let Some(line) = result? {
+        println!("{line}");
+    }
+    Ok(())
 }
 
-fn run(mut app: App, terminal: &mut DefaultTerminal, rx: Receiver<Event>) -> Result<()> {
+/// Attaches to the session a workflow names if it's running, else starts one: from the workflow, `--resume`'s
+/// snapshot, or empty, under the lowest free number. Returns its name, the socket, what to start it from, and a
+/// message if the workflow is new.
+fn connect(workflow: Option<String>, resume: bool) -> Result<(String, UnixStream, Option<Start>, Option<String>)> {
+    let dir = sock::dir()?;
+    let name = match &workflow {
+        Some(w) => w.clone(),
+        None => sock::next_name(sock::sessions(&dir)?.iter().map(|(n, _)| n.as_str())),
+    };
+    let path = sock::path(&dir, &name)?;
+    if let Some(stream) = sock::connect(&path)? {
+        return Ok((name, stream, None, None));
+    }
+    let mut new = None;
+    let session = match &workflow {
+        Some(w) => workflow::load(w)?.unwrap_or_else(|| {
+            new = Some(format!("\"{w}\" [New]"));
+            Session::default()
+        }),
+        None if resume => session::load()?,
+        None => Session::default(),
+    };
+    let stream = sock::start(&path, &name)?;
+    Ok((name, stream, Some(Start::new(session, workflow)), new))
+}
+
+fn run(app: &mut App, terminal: &mut DefaultTerminal, rx: Receiver<Event>) -> Result<()> {
     app.draw(terminal)?;
     loop {
         let event = match app.deadline {
@@ -119,10 +149,5 @@ fn run(mut app: App, terminal: &mut DefaultTerminal, rx: Receiver<Event>) -> Res
             app.draw(terminal)?;
         }
     }
-    let snapshot = app.snapshot();
-    app.kill_all();
-    if snapshot.terms.is_empty() {
-        return Ok(());
-    }
-    session::save(&snapshot)
+    Ok(())
 }

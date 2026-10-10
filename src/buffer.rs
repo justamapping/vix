@@ -38,6 +38,8 @@ pub enum Effect {
     Write,
     Quit { force: bool },
     QuitAll { force: bool },
+    /// `:qd` leaves the session running
+    Detach { force: bool },
     Reload,
     Yank(String),
     /// keys a read-only buffer passes up: `i a I A` with where they'd insert (`o O` without), `-`, `J`/`K`, `<C-^>`,
@@ -765,8 +767,10 @@ impl Buffer {
                 vec![]
             }
             "wq" | "x" if self.readonly => vec![Effect::Quit { force: false }],
+            "xd" if self.readonly => vec![Effect::Detach { force: false }],
             "w" => vec![Effect::Write],
             "wq" | "x" => vec![Effect::Write, Effect::Quit { force: false }],
+            "xd" => vec![Effect::Write, Effect::Detach { force: false }],
             "q" if self.modified() => {
                 self.message = Some("E37: No write since last change (add ! to override)".into());
                 vec![]
@@ -775,6 +779,8 @@ impl Buffer {
             "q!" => vec![Effect::Quit { force: true }],
             "qa" | "qall" => vec![Effect::QuitAll { force: false }],
             "qa!" | "qall!" => vec![Effect::QuitAll { force: true }],
+            "qd" | "detach" => vec![Effect::Detach { force: false }],
+            "qd!" | "detach!" => vec![Effect::Detach { force: true }],
             "e!" => vec![Effect::Reload],
             "e" | "edit" => {
                 self.message = Some("E32: No file name".into());
@@ -910,6 +916,9 @@ mod tests {
         assert!(b.message.as_deref().unwrap().starts_with("E37"));
         assert_eq!(feed(&mut b, ":q!\r"), vec![Effect::Quit { force: true }]);
         assert_eq!(feed(&mut b, ":qa!\r"), vec![Effect::QuitAll { force: true }]);
+        assert_eq!(feed(&mut b, ":qd\r"), vec![Effect::Detach { force: false }]);
+        assert_eq!(feed(&mut b, ":detach!\r"), vec![Effect::Detach { force: true }]);
+        assert_eq!(feed(&mut b, ":xd\r"), vec![Effect::Write, Effect::Detach { force: false }]);
         let edit = |name: &str, new| vec![Effect::Edit { name: name.into(), new }];
         assert_eq!(feed(&mut b, ":e web server\r"), edit("web server", false));
         assert_eq!(feed(&mut b, ":n api\r"), edit("api", true));
@@ -973,6 +982,7 @@ mod tests {
         assert_eq!(feed(&mut b, "\x1e"), vec![Effect::Alternate]);
         assert_eq!(feed(&mut b, "yy"), vec![Effect::Yank("$ ls\n".into())]);
         assert_eq!(feed(&mut b, ":x\r"), vec![Effect::Quit { force: false }]);
+        assert_eq!(feed(&mut b, ":xd\r"), vec![Effect::Detach { force: false }]);
     }
 
     #[test]

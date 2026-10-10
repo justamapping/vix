@@ -240,12 +240,33 @@ Once servers exist, the harness must also kill the session on drop, since killin
 | 3a | (done) `dump::exact`: scrollback, screens, alternate screen, cursor, modes | round trip into a fresh parser, cell for cell |
 | 3b | (done) `protocol.rs`: the enums, NDJSON read/write | encode/decode round trip, base64 bytes |
 | 3c | (done) `sock.rs`: socket dir, session names, stale sockets, `-l` info, starting the server | temp dir: naming, stale removal |
-| 3d | `server.rs`: `vix --server`, accept, the loop over `Mux`, every `Request` | a test client on a temp socket: Hello, type `echo hi`, read it back, Kill, KillSession |
-| 3e | `client.rs` + `App` on `Remote`, `main.rs` start-or-attach, `:qd`, hangup = detach | drive.rs: type, `:qd`, `vix -a`, same screen |
+| 3d | (done) `server.rs`: `vix --server`, accept, the loop over `Mux`, every `Request` | a test client on a temp socket: Hello, type `echo hi`, read it back, Kill, KillSession |
+| 3e | (done) `client.rs` + `App` on `Remote`, `main.rs` start-or-attach, `:qd`, hangup = detach | `tests/ui.rs`: type, `:qd`, `vix demo` again, same screen |
 | 3f | `-a`, `-l`, the nesting guard, version check, `-r` through the server, `VIX_SOCKET`/`VIX_ID` | drive.rs |
 | 3g | slow clients: bounded queue, on overflow drop and resend screens. Size follows latest | flood a terminal while a client is stopped |
 
-3e is the big one. It's mostly mechanical, following the table above. After 3f it's shippable; 3g is hardening.
+Notes from 3d:
+- `Mux` is generic over its event type (`From<PtyEvent>`), so `App` and the server each feed it their own loop.
+  `open` (spawning a session), `write` (`:w`), and `Term::carry` moved into it, shared by both until 3e.
+- Reattach shrinks full-screen programs' ptys a row for 50ms, then restores them, so they see two sizes and redraw.
+  Only terminals on the alternate screen, so idle shells don't redraw their prompts.
+- Not yet: batching output per client (3g), and a server whose creator never says `Hello` waits forever (harmless, but
+  `vix -l` shows it).
+
+Notes from 3e:
+- `:qd`, `:detach`, and `:xd` (write, then detach). The client prints `[detached from <name>]`, or
+  `[session <name> killed]` when another client killed it, or `[lost session <name>, see <log>]`.
+- `Save` and `KillSession` carry the asker's list row, since the list cursor is client state. `VERSION` is 2.
+- `:w` edits count as written once sent. The next `List` replaces the list buffer instead of rebasing onto it.
+- `:q!` and `:d` ask the server to kill. The terminal leaves the list when the server's next `List` arrives.
+- The picker sends `Refresh` when it opens, and takes the new directories when they arrive.
+- `Mux`'s `open`, `write`, and `Term::carry` are now only used by the server.
+- The UI harness kills every session under its `$HOME` on drop, since killing a client leaves its session running.
+- Not yet (3f): `-a`, `-l`, and the nesting guard. `vix demo` inside session `demo` attaches to itself.
+- Two `vix` started at the same moment can pick the same number. The second server fails to bind, and its client
+  says `server exited, see <log>`.
+
+After 3f it's shippable; 3g is hardening.
 
 ## risks
 
