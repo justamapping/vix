@@ -123,6 +123,9 @@ is viewing it, so it isn't flagged. Focusing a terminal clears its flags for eve
 - path: `$XDG_RUNTIME_DIR/vix/<name>.sock`, else `$TMPDIR/vix-$UID/<name>.sock`, in a 0700 directory
 - if connecting is refused, the socket is stale: remove it
 - macOS caps socket paths at 104 bytes, so long names error early
+- the directory must be yours and 0700, else vix refuses (tmux does the same), since connecting means typing into shells
+- checking whether a session is alive is a connect, so the server must drop connections that close before `Hello`
+- `vix --server` runs under `setsid` with stdin null and stdout/stderr to the log; done in 3c as `src/sock.rs`
 
 **Environment.** Every shell gets `VIX_SOCKET` and `VIX_ID`, which `ctl` needs later and the next point needs now.
 Shells inherit the environment of the client that started the server. Later attaches don't update it.
@@ -236,7 +239,7 @@ Once servers exist, the harness must also kill the session on drop, since killin
 | 3-0 | (done, `tests/ui.rs`) regression suite: today's `drive.rs` flows (`:w` ops, `:e :r :d`, exits under edits, picker, workflows, `-r`, bar overflow) recorded as expected screens against single-process vix | must still pass after 3e: userspace unchanged |
 | 3a | (done) `dump::exact`: scrollback, screens, alternate screen, cursor, modes | round trip into a fresh parser, cell for cell |
 | 3b | (done) `protocol.rs`: the enums, NDJSON read/write | encode/decode round trip, base64 bytes |
-| 3c | `sock.rs`: socket dir, session names, stale sockets, `-l` info, starting the server | temp dir: naming, stale removal |
+| 3c | (done) `sock.rs`: socket dir, session names, stale sockets, `-l` info, starting the server | temp dir: naming, stale removal |
 | 3d | `server.rs`: `vix --server`, accept, the loop over `Mux`, every `Request` | a test client on a temp socket: Hello, type `echo hi`, read it back, Kill, KillSession |
 | 3e | `client.rs` + `App` on `Remote`, `main.rs` start-or-attach, `:qd`, hangup = detach | drive.rs: type, `:qd`, `vix -a`, same screen |
 | 3f | `-a`, `-l`, the nesting guard, version check, `-r` through the server, `VIX_SOCKET`/`VIX_ID` | drive.rs |

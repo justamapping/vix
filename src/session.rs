@@ -28,13 +28,18 @@ pub struct Saved {
     pub output: Vec<u8>,
 }
 
-/// `$XDG_STATE_HOME/vix/last.toml`, else `~/.local/state/vix/last.toml`.
-pub fn path() -> Option<PathBuf> {
+/// `$XDG_STATE_HOME/vix`, else `~/.local/state/vix`.
+pub fn state_dir() -> Option<PathBuf> {
     let base = std::env::var_os("XDG_STATE_HOME")
         .filter(|v| !v.is_empty())
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/state")))?;
-    Some(base.join("vix/last.toml"))
+    Some(base.join("vix"))
+}
+
+/// `last.toml` in the state dir.
+pub fn path() -> Option<PathBuf> {
+    Some(state_dir()?.join("last.toml"))
 }
 
 impl Saved {

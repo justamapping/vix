@@ -19,6 +19,8 @@ mod pty;
 mod remap;
 mod render;
 mod session;
+#[allow(dead_code)] // used by the server and client, steps 3d and 3e
+mod sock;
 mod state;
 mod status;
 mod vt;
