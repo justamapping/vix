@@ -2,18 +2,18 @@
 
 use std::collections::HashMap;
 use std::fs;
-use std::io::{BufReader, Write};
-use std::net::Shutdown;
+use std::io::BufReader;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::{self, Sender};
-use std::thread::{self, JoinHandle};
+use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 
 use crate::mux::{Mux, PtyEvent, Term};
+use crate::outbox::Outbox;
 use crate::protocol::{self, Entry, List, Reply, Request, Screen, Start};
 use crate::session::{self, Saved, Session};
 use crate::sock;
@@ -21,8 +21,8 @@ use crate::workflow;
 
 // how long full-screen programs stay a row short on attach, so they see two sizes and redraw
 const NUDGE: Duration = Duration::from_millis(50);
-// a client that won't take its last messages within this is dropped anyway
-const BYE_TIMEOUT: Duration = Duration::from_secs(1);
+// bytes queued for a client that stopped reading before it's behind, and resent its screens once it reads again
+pub const BEHIND: usize = 4 << 20;
 
 pub enum Event {
     Pty(PtyEvent),
@@ -31,6 +31,8 @@ pub enum Event {
     Gone(usize),
     /// ptys shrunk on attach, to give their size back
     Fit(Vec<u64>),
+    /// a client that was behind read everything queued for it
+    Drained(usize),
 }
 
 impl From<PtyEvent> for Event {
@@ -40,9 +42,7 @@ impl From<PtyEvent> for Event {
 }
 
 struct Client {
-    out: Sender<Arc<Vec<u8>>>,
-    stream: UnixStream,
-    writer: JoinHandle<()>,
+    outbox: Outbox,
     /// said Hello, so it gets output
     attached: bool,
     focus: Option<u64>,
@@ -65,6 +65,8 @@ pub struct Server {
     left: SystemTime,
     /// where `KillSession` leaves the `--resume` snapshot
     snapshot: PathBuf,
+    /// bytes queued for a client before it's behind
+    limit: usize,
     tx: Sender<Event>,
 }
 
@@ -73,11 +75,11 @@ pub fn run(name: &str) -> Result<()> {
     let path = sock::path(&sock::dir()?, name)?;
     let listener = sock::bind(&path)?;
     eprintln!("vix {} serving {name}", env!("CARGO_PKG_VERSION"));
-    serve(listener, &path, name, session::path().context("no $HOME")?)
+    serve(listener, &path, name, session::path().context("no $HOME")?, BEHIND)
 }
 
 /// The server loop on `listener`, removing the socket at `path` once done.
-pub fn serve(listener: UnixListener, path: &Path, name: &str, snapshot: PathBuf) -> Result<()> {
+pub fn serve(listener: UnixListener, path: &Path, name: &str, snapshot: PathBuf, limit: usize) -> Result<()> {
     let (tx, rx) = mpsc::channel();
     let accept = tx.clone();
     thread::spawn(move || {
@@ -104,6 +106,7 @@ pub fn serve(listener: UnixListener, path: &Path, name: &str, snapshot: PathBuf)
         killed: false,
         left: SystemTime::now(),
         snapshot,
+        limit,
         tx,
     };
     let result = server.serve(rx);
@@ -141,6 +144,7 @@ impl Server {
                 }
             }
             Event::Fit(ids) => self.mux.fit(&ids)?,
+            Event::Drained(cid) => self.resend(cid)?,
             Event::Request(cid, request) => {
                 if let Err(e) = self.request(cid, request) {
                     self.send(cid, &Reply::Message { text: format!("{e:#}") });
@@ -174,18 +178,11 @@ impl Server {
             }
             let _ = tx.send(Event::Gone(cid));
         });
-        let (out, queue) = mpsc::channel::<Arc<Vec<u8>>>();
-        let mut socket = stream.try_clone()?;
-        // ends once the client is dropped and its queue drained
-        let writer = thread::spawn(move || {
-            for msg in queue {
-                if socket.write_all(&msg).is_err() {
-                    break;
-                }
-            }
-            let _ = socket.shutdown(Shutdown::Both);
-        });
-        self.clients.insert(cid, Client { out, stream, writer, attached: false, focus: None, size: self.size });
+        let tx = self.tx.clone();
+        let outbox = Outbox::new(&stream, self.limit, move || {
+            let _ = tx.send(Event::Drained(cid));
+        })?;
+        self.clients.insert(cid, Client { outbox, attached: false, focus: None, size: self.size });
         Ok(())
     }
 
@@ -284,12 +281,7 @@ impl Server {
         client.size = size;
         self.resize(size)?;
         let focus = if self.started {
-            let shrunk = self.mux.shrink()?;
-            let tx = self.tx.clone();
-            thread::spawn(move || {
-                thread::sleep(NUDGE);
-                let _ = tx.send(Event::Fit(shrunk));
-            });
+            self.nudge()?;
             self.last.filter(|id| self.mux.alive(*id))
         } else {
             self.started = true;
@@ -298,11 +290,43 @@ impl Server {
             self.mux.open(start.session().terms)?;
             None
         };
-        let screens = self.mux.exact().into_iter().map(|(id, bytes)| Screen { id, bytes }).collect();
-        let (cols, rows) = self.size;
-        self.send(cid, &Reply::Attached { cols, rows, list: self.list(None), screens, focus });
+        let attached = self.attached(focus);
+        self.force(cid, &attached);
         if let Some(c) = self.clients.get_mut(&cid) {
             c.attached = true;
+        }
+        Ok(())
+    }
+
+    /// Every screen as it is now, with the list.
+    fn attached(&mut self, focus: Option<u64>) -> Reply {
+        let screens = self.mux.exact().into_iter().map(|(id, bytes)| Screen { id, bytes }).collect();
+        let (cols, rows) = self.size;
+        Reply::Attached { cols, rows, list: self.list(None), screens, focus }
+    }
+
+    /// Makes full-screen programs redraw what `dump::exact` can't copy, by shrinking their ptys a moment.
+    fn nudge(&mut self) -> Result<()> {
+        let shrunk = self.mux.shrink()?;
+        let tx = self.tx.clone();
+        thread::spawn(move || {
+            thread::sleep(NUDGE);
+            let _ = tx.send(Event::Fit(shrunk));
+        });
+        Ok(())
+    }
+
+    /// A client that fell behind missed output, so once it reads again it gets every screen anew, like attaching.
+    fn resend(&mut self, cid: usize) -> Result<()> {
+        if !self.clients.get(&cid).is_some_and(|c| c.outbox.behind()) {
+            return Ok(());
+        }
+        eprintln!("client {cid} fell behind, resending its screens");
+        self.nudge()?;
+        let attached = self.attached(None);
+        self.force(cid, &attached);
+        if let Some(c) = self.clients.get(&cid) {
+            c.outbox.caught_up();
         }
         Ok(())
     }
@@ -349,7 +373,10 @@ impl Server {
         {
             eprintln!("saving the session: {e:#}");
         }
-        self.broadcast(&Reply::Bye { reason: "killed".into() });
+        let bye = Arc::new(protocol::encode(&Reply::Bye { reason: "killed".into() }));
+        for c in self.clients.values().filter(|c| c.attached) {
+            c.outbox.force(bye.clone());
+        }
         self.killed = true;
     }
 
@@ -369,14 +396,21 @@ impl Server {
         let opened = Arc::new(protocol::encode(&Reply::List(self.list(open))));
         for (cid, c) in &self.clients {
             if c.attached || asker == Some(*cid) {
-                let _ = c.out.send(if asker == Some(*cid) { opened.clone() } else { plain.clone() });
+                c.outbox.send(if asker == Some(*cid) { opened.clone() } else { plain.clone() });
             }
         }
     }
 
     fn send(&self, cid: usize, reply: &Reply) {
         if let Some(c) = self.clients.get(&cid) {
-            let _ = c.out.send(Arc::new(protocol::encode(reply)));
+            c.outbox.send(Arc::new(protocol::encode(reply)));
+        }
+    }
+
+    /// Past the client's limit, for what must arrive.
+    fn force(&self, cid: usize, reply: &Reply) {
+        if let Some(c) = self.clients.get(&cid) {
+            c.outbox.force(Arc::new(protocol::encode(reply)));
         }
     }
 
@@ -384,13 +418,13 @@ impl Server {
     fn broadcast(&self, reply: &Reply) {
         let msg = Arc::new(protocol::encode(reply));
         for c in self.clients.values().filter(|c| c.attached) {
-            let _ = c.out.send(msg.clone());
+            c.outbox.send(msg.clone());
         }
     }
 
     /// Says why, then drops the client once that's sent.
     fn bye(&mut self, cid: usize, reason: &str) {
-        self.send(cid, &Reply::Bye { reason: reason.into() });
+        self.force(cid, &Reply::Bye { reason: reason.into() });
         self.drop_client(cid);
     }
 
@@ -400,12 +434,9 @@ impl Server {
         }
     }
 
-    /// Lets every client's writer finish, but not wait forever on one that stopped reading.
     fn close_all(&mut self) {
         for (_, c) in self.clients.drain() {
-            let _ = c.stream.set_write_timeout(Some(BYE_TIMEOUT));
-            drop(c.out);
-            let _ = c.writer.join();
+            c.outbox.close();
         }
     }
 }
@@ -415,6 +446,7 @@ mod tests {
     use super::*;
     use crate::buffer::Line;
     use crate::vt;
+    use std::thread::JoinHandle;
 
     const TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -432,8 +464,12 @@ mod tests {
         }
 
         fn hello(path: &Path, start: Option<Start>) -> (Self, Reply) {
+            Self::sized(path, (40, 10), start)
+        }
+
+        fn sized(path: &Path, (cols, rows): (u16, u16), start: Option<Start>) -> (Self, Reply) {
             let mut c = Self::connect(path);
-            c.send(Request::Hello { version: protocol::VERSION, cols: 40, rows: 10, start });
+            c.send(Request::Hello { version: protocol::VERSION, cols, rows, start });
             let attached = c.recv().unwrap();
             (c, attached)
         }
@@ -459,22 +495,46 @@ mod tests {
         fn list(&mut self) -> List {
             self.until(|r| if let Reply::List(l) = r { Some(l) } else { None })
         }
+
+        fn resized(&mut self) -> (u16, u16) {
+            self.until(|r| if let Reply::Resized { cols, rows } = r { Some((cols, rows)) } else { None })
+        }
     }
 
     fn names(list: &List) -> Vec<&str> {
         list.terms.iter().map(|t| t.name.as_str()).collect()
     }
 
+    /// Whether `line` is on screen. Not scrollback: that's slow to read per message under a flood.
     fn shows(screen: &mut vt::Parser, line: &str) -> bool {
-        vt::text(screen.screen_mut()).iter().any(|l| l.trim() == line)
+        let cols = screen.screen().size().1;
+        screen.screen().rows(0, cols).any(|l| l.trim() == line)
+    }
+
+    /// Keeps a one-terminal replica up with `reply`, starting over on a resend. Returns whether it was one.
+    fn apply(replica: &mut vt::Parser, reply: Reply) -> bool {
+        match reply {
+            Reply::Output { bytes, .. } => replica.process(&bytes),
+            Reply::Attached { cols, rows, screens, .. } => {
+                *replica = vt::parser(cols, rows);
+                replica.process(&screens[0].bytes);
+                return true;
+            }
+            _ => {}
+        }
+        false
     }
 
     fn start(dir: &Path) -> (PathBuf, PathBuf, JoinHandle<Result<()>>) {
+        start_limited(dir, BEHIND)
+    }
+
+    fn start_limited(dir: &Path, limit: usize) -> (PathBuf, PathBuf, JoinHandle<Result<()>>) {
         let path = dir.join("t.sock");
         let last = dir.join("last.toml");
         let listener = sock::bind(&path).unwrap();
         let (p, l) = (path.clone(), last.clone());
-        (path, last, thread::spawn(move || serve(listener, &p, "t", l)))
+        (path, last, thread::spawn(move || serve(listener, &p, "t", l, limit)))
     }
 
     fn one(name: &str) -> Option<Start> {
@@ -564,5 +624,58 @@ mod tests {
         assert!(path.exists());
         server.join().unwrap().unwrap();
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn a_client_that_stops_reading_falls_behind_then_gets_screens_anew() {
+        let tmp = tempfile::Builder::new().prefix("vx").tempdir_in("/tmp").unwrap();
+        let (path, _, server) = start_limited(tmp.path(), 64 << 10);
+        let (mut stopped, attached) = TestClient::hello(&path, one("sh"));
+        let Reply::Attached { list, .. } = attached else { panic!("{attached:?}") };
+        let sh = list.terms[0].id;
+
+        // megabytes of output while `stopped` reads nothing; quoted so the echoed command can't wrap into `done`
+        let (mut b, attached) = TestClient::hello(&path, None);
+        let mut replica = vt::parser(40, 10);
+        apply(&mut replica, attached);
+        b.send(Request::Input { id: sh, bytes: b"yes | head -n 1000000; echo do\"\"ne\r".to_vec() });
+        b.until(|r| {
+            apply(&mut replica, r);
+            shows(&mut replica, "done").then_some(())
+        });
+
+        let (mut resent, mut output) = (false, 0);
+        let mut copy = vt::parser(40, 10);
+        stopped.until(|r| {
+            if let Reply::Output { bytes, .. } = &r {
+                output += bytes.len();
+            }
+            resent |= apply(&mut copy, r);
+            (resent && shows(&mut copy, "done")).then_some(())
+        });
+        assert!(output < 1 << 20, "dropped most of the flood, got {output} bytes");
+
+        b.send(Request::KillSession { cursor: 0 });
+        server.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn size_follows_the_client_that_typed_last() {
+        let tmp = tempfile::Builder::new().prefix("vx").tempdir_in("/tmp").unwrap();
+        let (path, _, server) = start(tmp.path());
+        let (mut a, attached) = TestClient::hello(&path, one("sh"));
+        let Reply::Attached { list, .. } = attached else { panic!("{attached:?}") };
+        let sh = list.terms[0].id;
+
+        let (mut b, attached) = TestClient::sized(&path, (60, 20), None);
+        assert!(matches!(attached, Reply::Attached { cols: 60, rows: 20, .. }), "{attached:?}");
+        assert_eq!(a.resized(), (60, 20));
+        a.send(Request::Input { id: sh, bytes: Vec::new() });
+        assert_eq!((a.resized(), b.resized()), ((40, 10), (40, 10)));
+        b.send(Request::Resize { cols: 70, rows: 20 });
+        assert_eq!(a.resized(), (70, 20));
+
+        a.send(Request::KillSession { cursor: 0 });
+        server.join().unwrap().unwrap();
     }
 }

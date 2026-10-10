@@ -12,6 +12,7 @@ mod listdiff;
 mod log;
 mod motion;
 mod mux;
+mod outbox;
 mod picker;
 mod proc;
 mod protocol;

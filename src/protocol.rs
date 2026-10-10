@@ -12,7 +12,7 @@ use crate::motion::Pos;
 use crate::session::{Saved, Session};
 
 /// Bump on any change to these types; client and server refuse to talk across versions.
-pub const VERSION: u32 = 3;
+pub const VERSION: u32 = 4;
 
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -44,6 +44,7 @@ pub enum Request {
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Reply {
+    /// also sent again, without `focus`, to a client that fell behind and missed output
     Attached { cols: u16, rows: u16, list: List, screens: Vec<Screen>, focus: Option<u64> },
     Output { id: u64, #[serde(with = "b64")] bytes: Vec<u8> },
     /// after any change; `open` only to the client that asked

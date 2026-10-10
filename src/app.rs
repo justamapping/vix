@@ -364,7 +364,19 @@ impl App {
                 };
                 false
             }
-            Reply::Attached { .. } | Reply::Info { .. } => false,
+            // resent after this client fell behind and missed output
+            Reply::Attached { cols, rows, list, screens, .. } => {
+                self.remote.resized(cols, rows);
+                // writes it missed the lists of are in this one, so it's loaded once rather than rebased
+                self.writing = self.writing.min(1);
+                self.listed(list);
+                self.remote.screens(screens);
+                if let View::Normal(id) = self.view {
+                    self.enter_normal(id);
+                }
+                true
+            }
+            Reply::Info { .. } => false,
         }
     }
 

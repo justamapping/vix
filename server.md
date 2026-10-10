@@ -243,15 +243,14 @@ Once servers exist, the harness must also kill the session on drop, since killin
 | 3d | (done) `server.rs`: `vix --server`, accept, the loop over `Mux`, every `Request` | a test client on a temp socket: Hello, type `echo hi`, read it back, Kill, KillSession |
 | 3e | (done) `client.rs` + `App` on `Remote`, `main.rs` start-or-attach, `:qd`, hangup = detach | `tests/ui.rs`: type, `:qd`, `vix demo` again, same screen |
 | 3f | (done) `-a`, `-l`, the nesting guard, version check, `-r` through the server, `VIX_SOCKET`/`VIX_ID` | `tests/ui.rs`: `vix -l` and `vix -a 0` from inside session 0, `vix -a` from outside |
-| 3g | slow clients: bounded queue, on overflow drop and resend screens. Size follows latest | flood a terminal while a client is stopped |
+| 3g | (done) slow clients: bounded queue, on overflow drop and resend screens. Size follows latest | `server.rs`: flood a terminal while a client isn't reading; the size follows whoever typed |
 
 Notes from 3d:
 - `Mux` is generic over its event type (`From<PtyEvent>`), so `App` and the server each feed it their own loop.
   `open` (spawning a session), `write` (`:w`), and `Term::carry` moved into it, shared by both until 3e.
 - Reattach shrinks full-screen programs' ptys a row for 50ms, then restores them, so they see two sizes and redraw.
   Only terminals on the alternate screen, so idle shells don't redraw their prompts.
-- Not yet: batching output per client (3g), and a server whose creator never says `Hello` waits forever (harmless, but
-  `vix -l` shows it).
+- Not yet: a server whose creator never says `Hello` waits forever (harmless, but `vix -l` shows it).
 
 Notes from 3e:
 - `:qd`, `:detach`, and `:xd` (write, then detach). The client prints `[detached from <name>]`, or
@@ -275,7 +274,19 @@ Notes from 3f:
 - Shells get `VIX_SOCKET` and `VIX_ID` (the terminal's id in its session).
 - The version check and `-r` through the server were already done in 3d and 3e.
 
-After 3f it's shippable; 3g is hardening.
+Notes from 3g:
+- Each client's messages go through an `Outbox` (`src/outbox.rs`): a writer thread, and a count of bytes queued.
+  Past 4 MiB the client is behind and gets no more until it has read what's queued. Then the server sends it
+  `Attached` again, every screen and the list, and nudges full-screen programs, like a reattach. `Attached` and
+  `Bye` always go through. `VERSION` is 4.
+- While behind, a client misses `Exited` and `Message` lines, and a `List`'s `open`, so a `:e` typed then doesn't
+  open. The resent list covers everything else.
+- Flood, measured in release: `yes | head -n 3000000` (9 MB) takes 4.5s through the server to a reading client,
+  4.2s from a bare pty. The pty is the bottleneck and a reading client never fell behind, so there's no output
+  batching.
+- Size follows latest was already there from 3d (typing and resizing); 3g tests it.
+
+Step 3 is done.
 
 ## risks
 
@@ -283,8 +294,8 @@ After 3f it's shippable; 3g is hardening.
   - the round-trip test
   - after attach, nudging each pty with a resize to the same size, which makes most TUIs redraw (tmux does
     this too)
-- **Output floods.** `yes` in one terminal pushes a lot of JSON. That's measured in 3g, and the server already
-  batches.
+- **Output floods.** `yes` in one terminal pushes a lot of JSON. Measured in 3g: about 7% over a bare pty, which
+  is the bottleneck.
 - **Upgrading vix while a session runs.** The old server and new client mismatch. The version check refuses with
   "session web runs an older vix, kill it or use that binary". tmux has the same problem.
 - **Server crashes.** The server has no screen, so it logs to `$XDG_STATE_HOME/vix/<name>.log`. When the socket

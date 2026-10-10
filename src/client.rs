@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use anyhow::{Result, bail};
 
-use crate::protocol::{self, List, Reply, Request, Start};
+use crate::protocol::{self, List, Reply, Request, Screen, Start};
 use crate::vt;
 
 // the server answers Hello at once; longer means it's stuck
@@ -64,11 +64,7 @@ impl Remote {
             Some(Reply::Attached { cols, rows, list, screens, focus }) => {
                 let mut remote = Self { terms: Vec::new(), stream, workflow: None, cols, rows };
                 remote.sync(&list);
-                for s in screens {
-                    if let Some(t) = remote.get_mut(s.id) {
-                        t.feed(&s.bytes);
-                    }
-                }
+                remote.screens(screens);
                 Ok((remote, focus, reader))
             }
             Some(Reply::Bye { reason }) => bail!(reason),
@@ -125,6 +121,17 @@ impl Remote {
         old
     }
 
+    /// Replaces replicas with exact copies, on attach or after falling behind.
+    pub fn screens(&mut self, screens: Vec<Screen>) {
+        let (cols, rows) = (self.cols, self.rows);
+        for s in screens {
+            if let Some(t) = self.get_mut(s.id) {
+                t.vt = vt::parser(cols, rows);
+                t.feed(&s.bytes);
+            }
+        }
+    }
+
     /// The server resized every terminal at this point in their output.
     pub fn resized(&mut self, cols: u16, rows: u16) {
         (self.cols, self.rows) = (cols, rows);
@@ -158,7 +165,7 @@ pub fn listen<E: Send + 'static>(mut reader: BufReader<UnixStream>, tx: Sender<E
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::{Entry, Screen};
+    use crate::protocol::Entry;
     use std::sync::mpsc;
 
     fn entry(id: u64, name: &str) -> Entry {
@@ -230,5 +237,9 @@ mod tests {
 
         remote.resized(30, 8);
         assert!(remote.terms().iter().all(|t| t.vt.screen().size() == (8, 30)));
+
+        // resent after falling behind: replaced, not appended
+        remote.screens(vec![Screen { id: 1, bytes: b"anew".to_vec() }]);
+        assert_eq!(remote.get(1).unwrap().vt.screen().contents(), "anew");
     }
 }
