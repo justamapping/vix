@@ -1,6 +1,6 @@
 # Vix plan
 
-See core.md for the philosophy. This is the working plan: what to build, in what order, and what's still open.
+See core.md for the philosophy. This is the working plan: what's built, what's next, and what's still open.
 Nothing here is final; build the pure pieces, use it, see what sticks.
 
 ## model
@@ -20,95 +20,162 @@ State is two axes: **view × mode**.
 
 ```
 vix                  list n      one terminal, "Untitled"
-list n   --<CR>-->   view i      open terminal under cursor, start typing, i.e. go into view<i>
-view i   --<C-\>-->  view n      the only key vix steals; our <Esc> key of vim
-view n   --<C-\>-->  view i      only right after entering, and sends a literal <C-\>; otherwise a no-op like <Esc>
-view n   --i/a-->    view i      (any insert key: i a I A o O)
-view n   -- - -->    list n      (oil's "go up"); also :q, :x
+list n   --<CR>-->   view i      open terminal under cursor, start typing
+view i   --<C-\>-->  view n      the only key vix steals (configurable)
+view n   --<C-\>-->  view i      only right after entering, and sends a literal <C-\>
+view n   --i/a-->    view i      (i a I A carry the line editor's cursor; o O just enter)
+view n   -- - / q -> list n      also :q, :x
 view n   --:q!-->    list n      kills the terminal and drops its line
+view n   --:d [n]--> view n      kills (named) terminal, moves to alternate/neighbor like :bd
 view n   --J/K-->    view n      next/prev terminal, counts work (3J)
+view n   --1-9-->    view n      chrome's cmd+1-9, 9 is last
 view n   --<C-^>-->  view n      alternate terminal
+any      --<C-p>-->  picker      fuzzy over name + cwd, previews the selection
 any      --:qa-->    quit vix    (:q only quits from the list)
 ```
 
-## list view
+## built
 
-The buffer is just names, one per line:
+- **list**: names with hidden stable ids; `:w` diffs into kill / rename / clone / spawn / reorder (`listdiff`).
+  `<CR>` on a modified list asks first. `:e name`, `:new name` from anywhere.
+- **view n**: read-only buffer over scrollback + screen, follows live output at the bottom, pinned elsewhere.
+  Motions, visual, search, yank via OSC 52, `:r name`, `:d [name]`. Mouse: wheel scrolls into view n, drag selects.
+- **config**: `~/.config/vix/config.toml`, vim key notation, non-recursive maps per mode, `escape`, `timeoutlen`,
+  `mouse`, status templates. A broken config falls back to defaults and says why.
+- **status bar**: vim-tabline tabs (current reversed, activity bold, bell yellow), slides around the current
+  terminal when it overflows. Fields `{mode} {name} {index} {total} {modified} {workflow} {terms}`.
+- **resume**: `vix -r` restores names, live cwd (pid -> cwd like tmux), and scrollback (`dump`), not programs.
+- **workflows**: `:w name` saves the list to `~/.config/vix/workflows/name.toml`, after which `:w` keeps saving
+  there. `vix name` opens one (or a new one, like `vim newfile`). Per terminal: `name`, `cwd` (`~` ok), `cmd`.
 
-```
-foo
-bar
-buzz
-```
-rmk: we can also open it under a configuration of these names/terminals, i.e. vix webworkflow
+## next: the server
 
-`jj<CR>` opens `buzz`. Edits are staged; `:w` applies, `u` / `:e!` discards.
+Detach, `vix ctl`, agents driving terminals, and running workflows headless all look like separate features. They
+aren't: they all fall out of making the list a long-lived object that more than one thing can talk to.
 
-### ids
+### the core primitive
 
-Each line carries a hidden id: the terminal's stable id (a counter, never reused). The id travels with the line
-through edits (yank/paste copies it). Stable rather than line position, so nothing renumbers after `:w` and a
-terminal exiting while the list has unsaved edits doesn't shift everyone else's id.
+The list, with three verbs on it:
 
-### `:w` rules
+| verb | what | already exists as |
+|---|---|---|
+| **reconcile** | desired list -> ops (spawn, kill, rename, clone, reorder) | `listdiff::diff`, `:w` |
+| **io** | send keys to a terminal, read its text | pty write, `vt::text` |
+| **watch** | stream of output, flags, exits, list changes | `Event` in `app.rs` |
 
-A pure function: `(old lines with ids, new lines with ids) -> Vec<Op>`.
+Everything else is a composition:
 
-| after `:w` | op |
+- the **UI** is a client that watches everything, renders, and turns local buffer edits into reconcile and io
+- a **ctl** call is one reconcile / io / watch, then exit
+- an **agent** is a ctl caller, often running inside one of the terminals it controls
+- **detach** is the UI leaving while the list keeps running
+- a **workflow** is a saved desired list; a **session** is a running one. `vix web` attaches to the running list
+  named web, else starts it from the saved one. `:w` saves the running list back. File <-> buffer <-> process, like vim
+
+So the server owns one list, and there is no separate session/window/pane hierarchy to learn.
+
+### reconcile is a 3-way diff
+
+With several writers (two UIs, an agent), a client's `:w` must not kill what it never saw. The client sends the
+ids it based its edits on: `diff(base, current, edited)`. Ids in `base` and missing from `edited` die; ids the server
+has that weren't in `base` (spawned by someone else meanwhile) stay. On a list change a client rebases its staged
+buffer with `Buffer::rebase(current)`, which exits, `:e`, and `:r` already go through.
+
+Interactive edits match by id. Applying a workflow file matches by name (first unused match), so
+`vix ctl apply web` is idempotent: run it twice, nothing happens the second time. `--prune` kills extras.
+
+### process model
+
+- one server per session (like zellij, unlike tmux's one-server-many-sessions): no session layer in the server,
+  crash isolation, and a session is exactly one workflow
+- socket `$XDG_RUNTIME_DIR/vix/<session>.sock`, else `$TMPDIR/vix-$UID/<session>.sock`, dir 0700
+- one binary: `vix` connects, starting `vix --server <session>` (setsid, stdio to /dev/null) if nothing listens
+- the server exits when its last terminal exits or on `kill-session`; SIGHUP of the UI is a detach, not a kill
+- every terminal gets `VIX_SOCKET` and `VIX_ID`, so `vix ctl` inside a terminal targets its own session and itself
+  by default. Plain `vix` inside vix still nests a new session (core.md's recursion requirement)
+
+### what lives where
+
+| server | client (UI) |
 |---|---|
-| id missing | kill |
-| id present, text changed | rename |
-| id appears n times | clone n-1 times (new shell, same cwd + env) |
-| line with no id | spawn fresh shell with that name |
-| order changed | reorder |
+| ptys, vt parsers (canonical; answers DA/DSR) | list buffer and its staged edits |
+| the list: ids, names, cwd, cmd, order | view n buffer, view × mode, picker |
+| activity/bell flags, cleared when a client focuses | vt replicas, fed by dump + output stream |
+| workflow name, scrollback | config, keymaps, outer terminal modes, rendering |
 
-So `yyp`, `Vjy` + `p`, `dd`, `ddp`, `cw`, `o` all fall out of plain text editing.
+The client keeps its own vt replica per terminal rather than asking the server for screens: rendering, view n, and
+search stay local and instant, and `app.rs` barely changes (a `Pty` becomes a remote handle). Attach is
+`dump::dump` per terminal (already written for `--resume`), then raw output. Clients discard their replicas' query
+replies; only the server answers.
 
-### unwritten changes
+Pty size follows the most recently active client (tmux's `window-size latest`).
 
-`<CR>` with a modified buffer asks first: "clone foo as web, kill api. write? [y/n]"; `y` writes, then opens the
-line under the cursor (including a line that was just spawned). Edits that change nothing (blank lines) write silently.
-A terminal that exits or is killed loses its lines from the list, even when the list has unsaved edits.
+### protocol
 
-## view mode
+Newline-delimited JSON over the unix socket, bytes as base64. Debuggable with `socat`, easy for agents; swap
+for binary frames only if a flood benchmark says so.
 
-Insert: full passthrough to the program except `<C-\>`.
+```
+client -> server                         server -> client
+Hello { kind: ui|ctl, cols, rows }       Attached { list, dumps, flags }
+Input { id, bytes }                      Output { id, bytes }
+Resize { cols, rows }                    List { terms }            (on any change)
+Focus { id }                             Flags { id, activity, bell }
+Write { base, lines }                    Exited { id, status }
+Spawn / Kill / Rename / Save             Reply { ok | error, ... }
+Read { id, range } / Wait { id, until }
+```
 
-Normal: the terminal's scrollback + screen becomes a text buffer. Scrolling and copying fall out.
-- `hjkl w b e f t / ? n % v V <C-v> y` etc. as text motions
-- `H`/`L` keep vim meaning (screen top/bottom)
-- `J`/`K` change terminal (unused in a read-only buffer, so free)
-- cursor on last line follows live output; anywhere else it's pinned
-- alt-screen programs (nvim, htop) have no scrollback, so the buffer is just the screen
+### ctl
 
-### editable output (open)
+`vix ctl <verb>`, a thin client. A target `<t>` is a name, an index (`3`), `%id`, or `.` (self; the default inside vix).
+
+```
+vix ctl ls [--json]                      index, id, name, state, cwd, cmd
+vix ctl new [name] [-c dir] [-- cmd]     prints the id
+vix ctl kill <t> | rename <t> <name>
+vix ctl send <t> 'npm test<CR>'          vim key notation (keyspec); --raw for literal bytes
+vix ctl read <t> [--all | --lines n]     the text view n would show
+vix ctl wait <t> --match pat | --idle 2s | --exit | --prompt   [--timeout]
+vix ctl run <t> 'npm test'               send + wait for the prompt, print that command's output, exit with its status
+vix ctl apply <workflow|file> [--prune] | save <workflow>
+vix ctl sessions | detach | kill-session
+```
+
+`ctl` also becomes the test harness: scripts that `send` and `read` replace `examples/drive.rs`.
+
+### shell integration
+
+`run` and `wait --prompt` need to know where a command's output starts and ends and how it exited. That's OSC 133
+(prompt / command / output / exit marks), which fish emits natively and which vix can inject for zsh/bash the way
+ghostty, kitty, and vscode do (`ZDOTDIR`, `--rcfile`). Without it, fall back to `--idle`.
+
+The same marks give humans `[[` `]]` between prompts in view n, "yank last output", and the running command and
+exit code for the list and the bar (old milestone 5).
+
+### steps
+
+Each one ships on its own.
+
+1. ~~**mux**~~ (done): move terminal ownership out of `App` into `mux.rs` (list, spawn, kill, reconcile, io, flags, events).
+   `App` uses it in-process. No behavior change.
+2. ~~**3-way diff**~~ (done) in `listdiff`, and `Buffer::rebase` for the staged list on list changes.
+3. **server/client**: `vix --server`, attach via dump + stream, detach on hangup and the detach command.
+4. **ctl**: ls, new, kill, rename, send, read, wait, apply, save.
+5. **sessions are workflows**: `vix web` attaches or starts, `vix -d web` starts detached.
+6. **shell integration**: OSC 133, `run`, `wait --prompt`, prompt jumps, running command in the list.
+
+## view n editing (open)
 
 The whole terminal output should be editable, not just navigable. Editing can't affect the process, so editing
-means working on a snapshot: delete noise, reshape, yank, `:w file`.
-
-- **A: blended into view n.** Operators (`d c x`) work directly; the first edit freezes the buffer off live output.
-  Problem: `i` already means "type into the program", so insert-mode edits need another way in.
-- **B: separate text state.** A key (TBD) snapshots the output into its own editable buffer with full vim keys.
-  Cleaner modes, one more state.
-
-Leaning B for clarity; decide after view n exists.
-
-rmk: it also means we get full access to the editing terminal output, somewhat unprecedented
+means a snapshot. Current lean: an edit operator (`d c x p`) freezes view n into a snapshot (`[snapshot]` in the
+bar). While frozen, `i a` edit text instead of going to the program; `:e!` returns to live. `:w file`, `:w !cmd`.
+Needs text objects (`iw iW i" ip`), `% { } * # .`, `<C-v>` first; those matter for yanking from output anyway.
 
 ## vim scope
 
-All valid text **motions** should exist in every buffer (list, view n, editable output). Operators, registers,
-and ex commands can grow from a small set. The text engine sits behind one interface so we can swap it later:
-
-```rust
-trait TextBuffer {
-    fn load(&mut self, lines: Vec<Line>);
-    fn key(&mut self, key: Key) -> Vec<Effect>;
-    fn lines(&self) -> &[Line];
-}
-```
-
-Start homemade. If it gets uncanny, try `nvim --embed` behind the same trait.
+All valid text **motions** should exist in every buffer (list, view n, snapshot). Operators, registers, and ex
+commands grow from a small set. Homemade for now; `nvim --embed` behind the same interface if it gets uncanny.
 
 ## architecture
 
@@ -116,75 +183,40 @@ Rust. Pure modules first, I/O at the edges.
 
 | module | kind | does |
 |---|---|---|
-| `state` | pure | `(State, Key) -> (State, Vec<Effect>)`, the view × mode machine |
+| `state` | pure | view transitions on the escape key, `1`-`9` goto |
 | `keymap` | pure | key sequences, counts, pending operators -> actions |
 | `motion` | pure | text motions over `&[String]` + cursor |
 | `listdiff` | pure | `:w` rules |
-| `buffer` | pure | `TextBuffer` impl |
-| `pty` | io | spawn/resize/read/write (`portable-pty`) |
-| `vt` | io-ish | per-pty screen + scrollback state, parsed from the pty's escape sequences (`vt100` crate) |
-| `render` | io | draw list / view / status line (`crossterm`, maybe `ratatui`) |
-| `input` | io | parse stdin incl. kitty keyboard `CSI u` encodings of `<C-\>` |
-| `config` | io | `~/.config/vix/config.toml` keybinds |
-| `keyspec` | pure | vim key notation (`<C-d>`) -> keys |
-| `remap` | pure | non-recursive mappings with prefix waiting |
-| `session` | io | `--resume` snapshot |
-| `proc` | io | pid -> cwd |
-| `server` | io | later: daemon owns ptys, clients over unix socket |
+| `buffer` | pure | the small vim over lines with hidden ids |
+| `remap` / `keyspec` | pure | non-recursive mappings, vim key notation |
+| `status` | pure | bar templates, overflow |
+| `picker` | pure | fuzzy finder over terminals |
+| `follow` / `carry` | pure | view n following output; `i a I A` moving a line editor's cursor |
+| `pty` / `proc` | io | spawn/resize/read/write, pid -> cwd |
+| `vt` / `dump` | io-ish | `vt100` per pty, query replies, text extraction; screen + scrollback as replayable bytes |
+| `render` / `input` | io | ratatui drawing; stdin incl. kitty `CSI u` and SGR mouse |
+| `config` / `session` / `workflow` | io | config.toml, `--resume`, workflow files |
+| `mux` | io | the running list: terminals, spawn / kill / reconcile, output -> flags |
+| `server` / `client` / `ctl` | io | next: socket, attach, thin ctl client |
 
-Status line is one row: `3/7 buzz  NORMAL [+]`. ptys are sized to `rows - 1`.
+vix is a multiplexer, not an emulator: it runs inside ghostty/kitty/etc. like tmux, and keeps a vt parser per pty
+only to know what's on screen.
 
-### multiplexer, not emulator
+## decided
 
-vix runs inside the user's terminal (ghostty, kitty, ...), like tmux. It still needs a vt parser per pty
-(tmux has its own in grid.c/screen.c): switching back to a terminal, view n text, `/` search, and list previews all
-need to know what's on screen, which only exists as a stream of escape sequences. We use a crate for this, we don't
-write one. Like tmux, programs never write to the outer terminal directly: pty output feeds `vt100`, and ratatui
-draws from it. vix answers the common queries itself (DA1, DSR/cursor position) and forwards input modes (mouse,
-bracketed paste, app cursor) and cursor shape for the terminal you're typing into.
-
-## milestones
-
-1. **spike**: one pty, raw passthrough, `<C-\>` drops to a placeholder screen and back. Proves input handling,
-   the riskiest part. No vt yet: if the program is on the main screen (shell), the placeholder borrows the outer
-   terminal's alt screen so leaving restores it; if it's on the alt screen (nvim), returning uses the SIGWINCH
-   redraw trick. Output while suspended is held and replayed.
-2. **state machine + list**: `state`, `keymap`, `listdiff` with tests. Multiple terminals, `j k gg G <CR> o dd yy p
-   cw i <Esc> :w u`, redraw from emulator on switch.
-3. **view n**: scrollback as text buffer, motions, `J/K`, `<C-^>`, `/`, yank to clipboard (OSC 52).
-   Done as a read-only buffer over the live vt (screen rows, wrapped lines are separate). Cursor on the last line
-   follows output; elsewhere the text is pinned (drifts once the 10k scrollback is full).
-4. **config**: `~/.config/vix/config.toml` (or `$XDG_CONFIG_HOME`), vim key notation, non-recursive maps.
-   Done as below. A broken config falls back to defaults and shows the error in the list.
-   ```toml
-   escape = "<C-Space>"   # any single ctrl key; default <C-\>; not <C-i> <C-m> <C-[> <C-h>
-   timeoutlen = 1000      # ms a partly typed mapping waits, like vim
-   [map.list]             # list normal + visual, like :noremap
-   "<C-j>" = "J"
-   [map.view]             # view n normal + visual
-   q = ":q<CR>"
-   ```
-   Also a minimal `vix --resume`: on exit the list (names, live cwd, last terminal) goes to
-   `~/.local/state/vix/last.toml`; no output or programs. Live cwd is asked from the OS (pid -> cwd, like tmux),
-   which also makes clone use the shell's current directory.
-5. **status**: per-terminal running command, bell, exited; maybe as virtual text in list. (cwd: `proc::cwd` exists)
-6. **server/client**: persistence, detach/attach, `$VIX` nesting depth, shell integration (`:x`/`:q` functions
-   calling `vix ctl` over `$VIX_SOCKET`).
-7. **editable output**: option A or B.
+- bare `vix` starts a new session; `vix name` attaches or starts the workflow's session
+- every way of quitting vix (`:qa`, `:q` from the list) kills the session, as today. Detaching is its own command
+  (name open: `:qd`? `:xd`?), plus hangup of the outer terminal
+- `vix ctl <verb>`, kept compartmentalized until its use is clearer
 
 ## open questions
 
-- editable output: blended or separate state, and the key to enter it
-- clone semantics beyond "same cwd + env" (re-run foreground command?)
-- vt parser: start with `vt100`, move to `alacritty_terminal` if fidelity breaks (claude code, nvim)
-- homemade vim vs `nvim --embed` once the list and view n exist
-- `:x` vs `:q` from inside a shell: `:q` = back to list (vim never destroys on `:q`), `:q!` = kill?
-- `/` from list: search names only, or scrollback too (jump to terminal + match line)?
-- restrict names to letters and numbers, so the rest of the line is free for comments/annotations (`web  # dev server`)
 
-## answers
-- blended state for now
-- start with cwd, later try current process
-- it's not a terminal emulator, it's comparable to tmux, it's a multiplexer
-- start with homemade for now
-- q! could delete it, x or q could save it buffer wise (keeps its name and process)
+- `read` for agents: rendered text (what a human sees, works for TUIs) vs an escape-stripped output log with
+  offsets for incremental reads (works for streams, garbage for TUIs). lean: rendered, with OSC 133 ranges
+- show who spawned a terminal (agent vs you) in the list?
+- workflow `cmd` capture: read the foreground process (`tcgetpgrp` + argv) on `:w`; type it on load without running it?
+- clone semantics beyond "same cwd" (re-run the foreground command?)
+- vt parser: `vt100` until fidelity breaks (claude code, nvim), then `alacritty_terminal`
+- `/` from the list: names only, or scrollback across all terminals into the picker?
+- restrict names so the rest of the line is free for annotations (`web  # dev server`)?

@@ -10,8 +10,10 @@ pub enum Op {
     Kill { id: u64 },
 }
 
-/// `:w`: Keep/Clone/Spawn in new line order (that order is the new list), then Kills. Blank lines are ignored.
-pub fn diff(old: &[u64], new: &[Line]) -> Vec<Op> {
+/// `:w` of `new`, edited from the list `base`, onto the running list `current`: Keep/Clone/Spawn in new line order
+/// (that order is the new list), then Kills. Only terminals the edit started from can die; ones added since stay,
+/// after the edited lines. Blank lines are ignored.
+pub fn diff(base: &[u64], current: &[(u64, &str)], new: &[Line]) -> Vec<Op> {
     let mut seen = HashSet::new();
     let mut ops = Vec::new();
     for line in new {
@@ -19,13 +21,16 @@ pub fn diff(old: &[u64], new: &[Line]) -> Vec<Op> {
         if name.is_empty() {
             continue;
         }
-        ops.push(match line.id.filter(|id| old.contains(id)) {
+        ops.push(match line.id.filter(|id| current.iter().any(|(c, _)| c == id)) {
             Some(id) if seen.insert(id) => Op::Keep { id, name },
             Some(from) => Op::Clone { from, name },
             None => Op::Spawn { name },
         });
     }
-    ops.extend(old.iter().filter(|id| !seen.contains(*id)).map(|&id| Op::Kill { id }));
+    let unseen = || current.iter().filter(|(id, _)| !seen.contains(id));
+    let (gone, added): (Vec<_>, Vec<_>) = unseen().partition(|(id, _)| base.contains(id));
+    ops.extend(added.into_iter().map(|&(id, name)| Op::Keep { id, name: name.into() }));
+    ops.extend(gone.into_iter().map(|&(id, _)| Op::Kill { id }));
     ops
 }
 
@@ -67,29 +72,43 @@ mod tests {
         Op::Keep { id, name: name.to_string() }
     }
 
+    /// Nothing changed underneath the edit.
+    fn d(old: &[u64], new: &[Line]) -> Vec<Op> {
+        let current: Vec<(u64, &str)> = old.iter().map(|&id| (id, "?")).collect();
+        diff(old, &current, new)
+    }
+
+    #[test]
+    fn terminals_added_since_survive() {
+        let new = [line(Some(2), "b"), line(Some(4), "gone")];
+        let current = [(1, "a"), (2, "b"), (3, "agent")];
+        let ops = vec![keep(2, "b"), Op::Spawn { name: "gone".into() }, keep(3, "agent"), Op::Kill { id: 1 }];
+        assert_eq!(diff(&[1, 2, 4], &current, &new), ops);
+    }
+
     #[test]
     fn unchanged() {
         let new = [line(Some(1), "foo"), line(Some(2), "bar")];
-        assert_eq!(diff(&[1, 2], &new), vec![keep(1, "foo"), keep(2, "bar")]);
+        assert_eq!(d(&[1, 2], &new), vec![keep(1, "foo"), keep(2, "bar")]);
     }
 
     #[test]
     fn rename_and_reorder() {
         let new = [line(Some(2), "bar"), line(Some(1), "fooo")];
-        assert_eq!(diff(&[1, 2], &new), vec![keep(2, "bar"), keep(1, "fooo")]);
+        assert_eq!(d(&[1, 2], &new), vec![keep(2, "bar"), keep(1, "fooo")]);
     }
 
     #[test]
     fn delete_kills() {
         let new = [line(Some(2), "bar")];
-        assert_eq!(diff(&[1, 2, 3], &new), vec![keep(2, "bar"), Op::Kill { id: 1 }, Op::Kill { id: 3 }]);
+        assert_eq!(d(&[1, 2, 3], &new), vec![keep(2, "bar"), Op::Kill { id: 1 }, Op::Kill { id: 3 }]);
     }
 
     #[test]
     fn duplicate_clones() {
         let new = [line(Some(1), "foo"), line(Some(1), "foo2"), line(Some(1), "foo")];
         assert_eq!(
-            diff(&[1], &new),
+            d(&[1], &new),
             vec![
                 keep(1, "foo"),
                 Op::Clone { from: 1, name: "foo2".into() },
@@ -102,7 +121,7 @@ mod tests {
     fn new_lines_spawn() {
         let new = [line(Some(1), "foo"), line(None, "web"), line(Some(9), "gone")];
         assert_eq!(
-            diff(&[1], &new),
+            d(&[1], &new),
             vec![keep(1, "foo"), Op::Spawn { name: "web".into() }, Op::Spawn { name: "gone".into() }]
         );
     }
@@ -110,17 +129,17 @@ mod tests {
     #[test]
     fn blank_lines_ignored() {
         let new = [line(None, ""), line(Some(1), "  "), line(Some(2), " bar ")];
-        assert_eq!(diff(&[1, 2], &new), vec![keep(2, "bar"), Op::Kill { id: 1 }]);
+        assert_eq!(d(&[1, 2], &new), vec![keep(2, "bar"), Op::Kill { id: 1 }]);
     }
 
     #[test]
     fn summaries() {
         let old = [(1, "foo"), (2, "api")];
         let new = [line(Some(1), "foo"), line(Some(1), "foo"), line(Some(1), "web2"), line(None, "web")];
-        assert_eq!(summary(&old, &diff(&[1, 2], &new)), "clone foo, clone foo as web2, spawn web, kill api");
+        assert_eq!(summary(&old, &d(&[1, 2], &new)), "clone foo, clone foo as web2, spawn web, kill api");
         let new = [line(Some(2), "api"), line(Some(1), "bar")];
-        assert_eq!(summary(&old, &diff(&[1, 2], &new)), "reorder, rename foo to bar");
+        assert_eq!(summary(&old, &d(&[1, 2], &new)), "reorder, rename foo to bar");
         let new = [line(Some(1), "foo"), line(None, ""), line(Some(2), "api")];
-        assert_eq!(summary(&old, &diff(&[1, 2], &new)), "");
+        assert_eq!(summary(&old, &d(&[1, 2], &new)), "");
     }
 }

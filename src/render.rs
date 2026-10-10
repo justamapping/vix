@@ -7,6 +7,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::buffer::{Buffer, Mode};
 use crate::picker::Picker;
+use crate::status::{self, Kind, Seg};
 
 /// Screen column of char index `col`.
 fn x_of(text: &str, col: usize) -> u16 {
@@ -27,8 +28,23 @@ pub fn col_at(text: &str, x: u16) -> usize {
 
 /// The bottom row's text when no command line or message takes it over.
 pub struct Bar {
-    pub left: String,
-    pub right: String,
+    pub left: Vec<Seg>,
+    pub right: Vec<Seg>,
+}
+
+/// Tabline-like: the current terminal reversed, the rest dim unless something happened in them.
+fn spans(segs: &[Seg]) -> Vec<Span<'static>> {
+    let dim = Style::new().fg(Color::Indexed(245));
+    let style = |kind| match kind {
+        Kind::Text => Style::new(),
+        Kind::Mode => Style::new().add_modifier(Modifier::BOLD),
+        Kind::Current => Style::new().add_modifier(Modifier::REVERSED | Modifier::BOLD),
+        Kind::Alternate => dim.add_modifier(Modifier::ITALIC),
+        Kind::Other | Kind::More => dim,
+        Kind::Activity => Style::new().add_modifier(Modifier::BOLD),
+        Kind::Bell => Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+    };
+    segs.iter().map(|s| Span::styled(s.text.clone(), style(s.kind))).collect()
 }
 
 /// The command line or a message, which take over the bottom row.
@@ -82,10 +98,12 @@ fn bottom(frame: &mut Frame, buf: Option<&Buffer>, bar: Option<&Bar>) {
         return;
     };
     frame.render_widget(Clear, row);
+    let left = Line::from(buf.and_then(prompt).map_or_else(|| spans(&bar.left), |p| vec![Span::raw(p)]));
     if !buf.is_some_and(|b| b.mode == Mode::Command) {
-        frame.render_widget(Paragraph::new(bar.right.as_str()).right_aligned(), row);
+        let room = (area.width as usize).saturating_sub(left.width() + 1);
+        let right = Line::from(spans(&status::fit(bar.right.clone(), room)));
+        frame.render_widget(Paragraph::new(right).right_aligned(), row);
     }
-    let left = buf.and_then(prompt).unwrap_or_else(|| bar.left.clone());
     frame.render_widget(Paragraph::new(left), row);
 }
 

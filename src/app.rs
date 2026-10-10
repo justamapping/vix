@@ -1,9 +1,7 @@
-use std::collections::HashMap;
 use std::io::{self, ErrorKind, Read, Write};
-use std::path::{Path, PathBuf};
 use std::sync::mpsc::Sender;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use anyhow::Result;
 use ratatui::DefaultTerminal;
@@ -11,19 +9,18 @@ use ratatui::DefaultTerminal;
 use crate::buffer::{self, Buffer, Effect, Line};
 use crate::carry;
 use crate::config::Config;
-use crate::dump;
 use crate::follow;
 use crate::input::{self, Input, Key, Mouse, MouseKind};
-use crate::listdiff::{self, Op};
+use crate::listdiff;
 use crate::motion::Pos;
+use crate::mux::{Mux, Term};
 use crate::picker::{Item, Pick, Picker};
-use crate::proc;
-use crate::pty::Pty;
 use crate::render::{self, Bar};
 use crate::session::{Saved, Session};
 use crate::state::{self, View};
-use crate::status::{Entry, Info};
+use crate::status::{Entry, Info, Kind, Seg};
 use crate::vt::{self, Modes};
+use crate::workflow;
 
 pub enum Event {
     Input(Vec<u8>),
@@ -33,41 +30,15 @@ pub enum Event {
     Resize,
 }
 
-// output this soon after a spawn or resize is the program starting or redrawing, not activity
-const SPAWN_QUIET: Duration = Duration::from_millis(1000);
-const RESIZE_QUIET: Duration = Duration::from_millis(250);
-
-pub struct Term {
-    id: u64,
-    name: String,
-    cwd: PathBuf,
-    pty: Pty,
-    vt: vt::Parser,
-    /// output or a bell since it was last viewed
-    activity: bool,
-    bell: bool,
-    quiet: Instant,
-}
-
-impl Term {
-    /// Where the shell is now, falling back to where it started.
-    fn cwd(&self) -> PathBuf {
-        self.pty.pid().and_then(proc::cwd).unwrap_or_else(|| self.cwd.clone())
-    }
-}
-
 pub struct App {
-    terms: Vec<Term>,
+    mux: Mux,
     list: Buffer,
     /// view n's read-only buffer over the viewed terminal's text
     normal: Buffer,
     view: View,
-    next_id: u64,
     cols: u16,
     rows: u16,
     outer: Option<Modes>,
-    cwd: PathBuf,
-    tx: Sender<Event>,
     /// view n was just entered with `<C-\>`, so another one sends it literally
     fresh: bool,
     /// view n was entered with the wheel, so scrolling back to the bottom returns to view i
@@ -82,6 +53,8 @@ pub struct App {
     confirm: Option<usize>,
     /// `<C-p>`'s fuzzy finder, drawn over the terminal it has selected
     picker: Option<Picker>,
+    /// the workflow `:w` also saves to, once the list has one
+    workflow: Option<String>,
     config: Config,
     /// when a partly typed mapping gives up waiting
     pub deadline: Option<Instant>,
@@ -109,7 +82,7 @@ pub fn pump(mut src: impl Read + Send + 'static, tx: Sender<Event>, wrap: impl F
 }
 
 impl App {
-    pub fn new(tx: Sender<Event>, cols: u16, rows: u16, config: Config, session: Session) -> Result<Self> {
+    pub fn new(tx: Sender<Event>, cols: u16, rows: u16, config: Config, session: Session, workflow: Option<String>) -> Result<Self> {
         let cwd = std::env::current_dir()?;
         let mut normal = Buffer::new(Vec::new());
         normal.readonly = true;
@@ -118,16 +91,13 @@ impl App {
         list.maps = config.list.clone();
         list.insert_maps = config.list_insert.clone();
         let mut app = Self {
-            terms: Vec::new(),
+            mux: Mux::new(tx, cols, rows, cwd.clone()),
             list,
             normal,
             view: View::List,
-            next_id: 0,
             cols,
             rows,
             outer: None,
-            cwd: cwd.clone(),
-            tx,
             fresh: false,
             wheeled: false,
             press: None,
@@ -136,31 +106,51 @@ impl App {
             alt: None,
             confirm: None,
             picker: None,
+            workflow,
             config,
             deadline: None,
             quit: false,
         };
         app.size_buffers();
+        app.mux.resize(cols, app.term_rows())?;
         let mut saved = session.terms;
         if saved.is_empty() {
-            saved.push(Saved { name: "Untitled".into(), cwd: cwd.clone(), output: Vec::new() });
+            saved.push(Saved::new("Untitled", cwd.clone()));
         }
-        for Saved { name, cwd: dir, output } in saved {
-            let dir = if dir.is_dir() { dir } else { cwd.clone() };
-            let mut t = app.spawn(name, dir)?;
-            dump::restore(&mut t.vt, &output);
-            app.terms.push(t);
+        for mut s in saved {
+            if !s.cwd.is_dir() {
+                s.cwd = cwd.clone();
+            }
+            app.mux.spawn(s)?;
         }
         app.list.load(app.lines());
         app.list.place((session.cursor, 0), 0);
         Ok(app)
     }
 
+    /// The list's names, directories, and commands, without output.
+    fn session(&self) -> Session {
+        Session { cursor: self.cursor(), terms: self.mux.saved() }
+    }
+
+    /// The list row of the viewed or last viewed terminal.
+    fn cursor(&self) -> usize {
+        let at = self.viewing().or(self.last).and_then(|id| self.mux.position(id));
+        at.unwrap_or(self.list.cursor.0)
+    }
+
     /// The list as `--resume` will bring it back.
     pub fn snapshot(&mut self) -> Session {
-        let terms = self.terms.iter_mut().map(|t| Saved { name: t.name.clone(), cwd: t.cwd(), output: dump::dump(&mut t.vt) }).collect();
-        let at = self.viewing().or(self.last).and_then(|id| self.terms.iter().position(|t| t.id == id));
-        Session { cursor: at.unwrap_or(self.list.cursor.0), terms }
+        Session { cursor: self.cursor(), terms: self.mux.dumped() }
+    }
+
+    /// Saves the list as workflow `name`, which `:w` then keeps saving to.
+    fn save_workflow(&mut self, name: String) {
+        self.list.message = Some(match workflow::save(&name, self.session()) {
+            Ok(()) => format!("\"{name}\" {} terminals written", self.mux.len()),
+            Err(e) => format!("{e:#}"),
+        });
+        self.workflow = Some(name);
     }
 
     pub fn message(&mut self, msg: String) {
@@ -177,26 +167,16 @@ impl App {
         self.normal.height = self.term_rows().max(1) as usize;
     }
 
-    fn spawn(&mut self, name: String, cwd: PathBuf) -> Result<Term> {
-        let id = self.next_id;
-        self.next_id += 1;
-        let rows = self.term_rows();
-        let pty = Pty::spawn(self.cols, rows, &cwd)?;
-        pump(pty.reader()?, self.tx.clone(), move |b| Event::Output(id, b), Event::Exited(id));
-        let vt = vt::parser(self.cols, rows);
-        Ok(Term { id, name, cwd, pty, vt, activity: false, bell: false, quiet: Instant::now() + SPAWN_QUIET })
-    }
-
     fn lines(&self) -> Vec<Line> {
-        self.terms.iter().map(|t| Line { id: Some(t.id), text: t.name.clone() }).collect()
+        self.mux.terms().iter().map(|t| Line { id: Some(t.id), text: t.name.clone() }).collect()
     }
 
     fn term(&mut self, id: u64) -> Option<&mut Term> {
-        self.terms.iter_mut().find(|t| t.id == id)
+        self.mux.get_mut(id)
     }
 
     fn alive(&self, id: u64) -> bool {
-        self.terms.iter().any(|t| t.id == id)
+        self.mux.alive(id)
     }
 
     fn viewing(&self) -> Option<u64> {
@@ -215,7 +195,7 @@ impl App {
             self.alt = self.last.replace(id);
         }
         if let Some(t) = self.term(id) {
-            (t.activity, t.bell) = (false, false);
+            t.seen();
         }
     }
 
@@ -251,26 +231,19 @@ impl App {
     }
 
     pub fn kill_all(&mut self) {
-        for t in &mut self.terms {
-            t.pty.kill();
-        }
+        self.mux.kill_all();
     }
 
     /// Forgets a terminal that exited or was killed; its lines leave the list even if it has edits.
     fn remove(&mut self, id: u64) -> Option<Term> {
-        let i = self.terms.iter().position(|t| t.id == id)?;
-        let t = self.terms.remove(i);
+        let t = self.mux.remove(id)?;
         if let Some(p) = &mut self.picker {
             p.remove(id);
         }
         if self.viewing() == Some(id) {
             self.go_list(id);
         }
-        if self.list.modified() {
-            self.list.remove_id(id);
-        } else {
-            self.list.load(self.lines());
-        }
+        self.list.rebase(self.lines());
         Some(t)
     }
 
@@ -282,19 +255,8 @@ impl App {
                 let viewed = self.viewing() == Some(id);
                 let Some(t) = self.term(id) else { return Ok(false) };
                 let before = follow::live(t.vt.screen_mut());
-                t.vt.process(&bytes);
+                let flagged = t.feed(&bytes, viewed)?;
                 let after = follow::live(t.vt.screen_mut());
-                let replies = std::mem::take(&mut t.vt.callbacks_mut().replies);
-                if !replies.is_empty() {
-                    t.pty.write(&replies)?;
-                }
-                let flags = (t.activity, t.bell);
-                let bell = std::mem::take(&mut t.vt.callbacks_mut().bell);
-                if !viewed {
-                    t.bell |= bell;
-                    t.activity |= Instant::now() >= t.quiet;
-                }
-                let flagged = (t.activity, t.bell) != flags;
                 if normal {
                     self.stale = true;
                     if self.normal.mode == buffer::Mode::Normal {
@@ -317,12 +279,7 @@ impl App {
                 let (cols, rows) = crossterm::terminal::size()?;
                 (self.cols, self.rows) = (cols, rows);
                 self.size_buffers();
-                let rows = self.term_rows();
-                for t in &mut self.terms {
-                    t.pty.resize(cols, rows)?;
-                    t.vt.screen_mut().set_size(rows, cols);
-                    t.quiet = t.quiet.max(Instant::now() + RESIZE_QUIET);
-                }
+                self.mux.resize(cols, self.term_rows())?;
                 if let View::Normal(id) = self.view {
                     self.enter_normal(id);
                 }
@@ -378,7 +335,7 @@ impl App {
                 if let Some(t) = self.term(id)
                     && !out.is_empty()
                 {
-                    t.pty.write(&out)?;
+                    t.write(&out)?;
                 }
                 if next == View::Normal(id) {
                     self.enter_normal(id);
@@ -390,7 +347,7 @@ impl App {
                 if std::mem::take(&mut self.fresh) {
                     let (next, out) = state::step(self.view, Input::Escape, self.config.escape);
                     if let Some(t) = self.term(id) {
-                        t.pty.write(&out)?;
+                        t.write(&out)?;
                     }
                     self.set_view(next);
                 }
@@ -421,10 +378,11 @@ impl App {
     fn pick(&mut self) {
         let alternate = if self.viewing().is_some() { self.alt } else { self.last };
         let mut items: Vec<Item> = self
-            .terms
+            .mux
+            .terms()
             .iter()
             .enumerate()
-            .map(|(i, t)| Item { id: t.id, index: i + 1, name: t.name.clone(), cwd: tilde(&t.cwd()) })
+            .map(|(i, t)| Item { id: t.id, index: i + 1, name: t.name.clone(), cwd: workflow::tilde(&t.cwd()) })
             .collect();
         if let Some(i) = items.iter().position(|item| Some(item.id) == alternate) {
             let item = items.remove(i);
@@ -477,15 +435,15 @@ impl App {
                 Effect::Parent | Effect::Quit { force: false } => self.go_list(id),
                 Effect::Quit { force: true } => {
                     if let Some(mut t) = self.remove(id) {
-                        t.pty.kill();
+                        t.kill();
                         self.list.message = Some(format!("{} killed", t.name));
                     }
                 }
                 Effect::QuitAll { force } => self.quit_all(force, true),
                 Effect::Switch(n) => {
-                    let i = self.terms.iter().position(|t| t.id == id).unwrap_or(0) as isize;
-                    let j = (i + n).clamp(0, self.terms.len() as isize - 1) as usize;
-                    let next = self.terms[j].id;
+                    let i = self.mux.position(id).unwrap_or(0) as isize;
+                    let j = (i + n).clamp(0, self.mux.len() as isize - 1) as usize;
+                    let next = self.mux.terms()[j].id;
                     if next != id {
                         self.enter_normal(next);
                     }
@@ -504,14 +462,14 @@ impl App {
                     self.refresh_normal();
                 }
                 Effect::Edit { name, new } => self.edit(name, new, Some(id)),
-                Effect::Goto(n) => match state::goto(n, self.terms.len()) {
-                    Some(i) => self.enter_normal(self.terms[i].id),
+                Effect::Goto(n) => match state::goto(n, self.mux.len()) {
+                    Some(i) => self.enter_normal(self.mux.terms()[i].id),
                     None => self.normal.message = Some(format!("no terminal {n}")),
                 },
                 Effect::Pick => self.pick(),
                 Effect::Delete(name) => self.delete(id, name),
                 Effect::Rename(name) => self.rename(id, name),
-                Effect::Open(_) | Effect::Write => {}
+                Effect::Open(_) | Effect::Write | Effect::Save(_) => {}
             }
         }
         Ok(())
@@ -520,12 +478,12 @@ impl App {
     /// Moves a line editor's cursor to where `i a I A` asked, when that's on its line; anywhere else it stays put.
     fn carry(&mut self, id: u64, (row, index): Pos) -> Result<()> {
         let Some(t) = self.term(id) else { return Ok(()) };
-        if !t.pty.raw() {
+        if !t.raw() {
             return Ok(());
         }
         let Some(row) = row.checked_sub(vt::history(t.vt.screen_mut())) else { return Ok(()) };
         if let Some(keys) = carry::arrows(t.vt.screen(), row as u16, index) {
-            t.pty.write(&keys)?;
+            t.write(&keys)?;
         }
         Ok(())
     }
@@ -534,7 +492,7 @@ impl App {
     fn delete(&mut self, id: u64, name: Option<String>) {
         let target = match &name {
             None => id,
-            Some(name) => match self.terms.iter().find(|t| &t.name == name) {
+            Some(name) => match self.mux.terms().iter().find(|t| &t.name == name) {
                 Some(t) => t.id,
                 None => {
                     self.normal.message = Some(format!("E94: No matching terminal for {name}"));
@@ -544,7 +502,7 @@ impl App {
         };
         let next = if target == id { self.successor(id) } else { Some(id) };
         let Some(mut t) = self.remove(target) else { return };
-        t.pty.kill();
+        t.kill();
         let msg = format!("{} killed", t.name);
         match next {
             Some(next) if next != id => {
@@ -561,20 +519,21 @@ impl App {
         if let Some(alt) = self.alt.filter(|a| *a != id && self.alive(*a)) {
             return Some(alt);
         }
-        let i = self.terms.iter().position(|t| t.id == id)?;
-        self.terms.get(i + 1).or(i.checked_sub(1).and_then(|j| self.terms.get(j))).map(|t| t.id)
+        let terms = self.mux.terms();
+        let i = self.mux.position(id)?;
+        terms.get(i + 1).or(i.checked_sub(1).and_then(|j| terms.get(j))).map(|t| t.id)
     }
 
     /// `:r name` from view n on `id`.
     fn rename(&mut self, id: u64, name: String) {
-        let Some(t) = self.term(id) else { return };
-        let old = std::mem::replace(&mut t.name, name.clone());
-        self.list.rename_id(id, &old, &name);
+        if self.mux.rename(id, name).is_some() {
+            self.list.rebase(self.lines());
+        }
     }
 
     /// The program in view i asked for the mouse, so events go to it as they are.
     fn program_mouse(&self, id: u64) -> bool {
-        !self.config.mouse || self.terms.iter().any(|t| t.id == id && vt::modes(&t.vt).mouse != 0)
+        !self.config.mouse || self.mux.get(id).is_some_and(|t| vt::modes(&t.vt).mouse != 0)
     }
 
     fn mouse(&mut self, m: Mouse) -> Result<()> {
@@ -582,7 +541,7 @@ impl App {
         match self.view {
             View::Insert(id) if self.program_mouse(id) => {
                 if let Some(t) = self.term(id) {
-                    t.pty.write(&m.encode())?;
+                    t.write(&m.encode())?;
                 }
             }
             View::Insert(id) => self.insert_mouse(id, m, kind)?,
@@ -628,7 +587,7 @@ impl App {
                     (true, true) => "\x1bOA",
                     (false, true) => "\x1bOB",
                 };
-                t.pty.write(arrow.repeat(buffer::WHEEL).as_bytes())?;
+                t.write(arrow.repeat(buffer::WHEEL).as_bytes())?;
             }
             MouseKind::WheelUp if vt::history(t.vt.screen_mut()) > 0 => {
                 self.enter_normal(id);
@@ -685,6 +644,13 @@ impl App {
                 }
                 Effect::Write => {
                     self.write();
+                    if let Some(name) = self.workflow.clone() {
+                        self.save_workflow(name);
+                    }
+                }
+                Effect::Save(name) => {
+                    self.write();
+                    self.save_workflow(name);
                 }
                 Effect::Quit { .. } => self.quit = true,
                 Effect::QuitAll { force } => self.quit_all(force, false),
@@ -699,21 +665,14 @@ impl App {
 
     /// `:e name` / `:new name`: views the terminal called `name`, or spawns it at the end of the list in `from`'s directory.
     fn edit(&mut self, name: String, new: bool, from: Option<u64>) {
-        if let Some(id) = self.terms.iter().find(|t| !new && t.name == name).map(|t| t.id) {
+        if let Some(id) = self.mux.terms().iter().find(|t| !new && t.name == name).map(|t| t.id) {
             self.set_view(View::Insert(id));
             return;
         }
-        let cwd = self.terms.iter().find(|t| Some(t.id) == from).map_or(self.cwd.clone(), Term::cwd);
-        match self.spawn(name, cwd) {
-            Ok(t) => {
-                let line = Line { id: Some(t.id), text: t.name.clone() };
-                let id = t.id;
-                self.terms.push(t);
-                if self.list.modified() {
-                    self.list.push_saved(line);
-                } else {
-                    self.list.load(self.lines());
-                }
+        let cwd = from.and_then(|id| self.mux.get(id)).map_or(self.mux.cwd.clone(), Term::cwd);
+        match self.mux.spawn(Saved::new(name.clone(), cwd)) {
+            Ok(id) => {
+                self.list.rebase(self.lines());
                 self.set_view(View::Insert(id));
             }
             Err(e) => {
@@ -734,55 +693,21 @@ impl App {
         if !self.list.modified() {
             return String::new();
         }
-        let old: Vec<(u64, &str)> = self.terms.iter().map(|t| (t.id, t.name.as_str())).collect();
-        let ids: Vec<u64> = old.iter().map(|(id, _)| *id).collect();
-        listdiff::summary(&old, &listdiff::diff(&ids, &self.list.lines))
+        let current = self.current();
+        listdiff::summary(&current, &listdiff::diff(&self.list.base(), &current, &self.list.lines))
+    }
+
+    fn current(&self) -> Vec<(u64, &str)> {
+        self.mux.terms().iter().map(|t| (t.id, t.name.as_str())).collect()
     }
 
     /// `:w`: reconcile running terminals with the list buffer. Returns the id each old list line ended up with.
     fn write(&mut self) -> Vec<Option<u64>> {
-        let old: Vec<u64> = self.terms.iter().map(|t| t.id).collect();
-        let ops = listdiff::diff(&old, &self.list.lines);
-        let mut pool: HashMap<u64, Term> = self.terms.drain(..).map(|t| (t.id, t)).collect();
-        let mut next: Vec<Term> = Vec::new();
-        let mut placed: Vec<Option<u64>> = Vec::new();
-        let mut errors = Vec::new();
-        for op in ops {
-            let spawned = match op {
-                Op::Keep { id, name } => {
-                    let mut t = pool.remove(&id).expect("diff only keeps known ids");
-                    t.name = name;
-                    placed.push(Some(id));
-                    next.push(t);
-                    continue;
-                }
-                Op::Kill { id } => {
-                    if let Some(mut t) = pool.remove(&id) {
-                        t.pty.kill();
-                    }
-                    continue;
-                }
-                Op::Clone { from, name } => {
-                    let cwd = next.iter().find(|t| t.id == from).map_or(self.cwd.clone(), Term::cwd);
-                    self.spawn(name, cwd)
-                }
-                Op::Spawn { name } => self.spawn(name, self.cwd.clone()),
-            };
-            match spawned {
-                Ok(t) => {
-                    placed.push(Some(t.id));
-                    next.push(t);
-                }
-                Err(e) => {
-                    placed.push(None);
-                    errors.push(e);
-                }
-            }
-        }
+        let ops = listdiff::diff(&self.list.base(), &self.current(), &self.list.lines);
+        let (placed, errors) = self.mux.reconcile(ops);
         // ops came in non-blank line order
         let mut placed = placed.into_iter();
         let ids = self.list.lines.iter().map(|l| if l.text.trim().is_empty() { None } else { placed.next().flatten() }).collect();
-        self.terms = next;
         self.list.load(self.lines());
         if let Some(e) = errors.first() {
             self.list.message = Some(format!("spawn failed: {e}"));
@@ -795,12 +720,14 @@ impl App {
         let status = &self.config.status;
         if !status.enabled {
             let modified = if self.list.modified() { "[+]" } else { "" };
-            return (self.view == View::List).then(|| Bar { left: self.list.mode.label().into(), right: modified.into() });
+            let seg = |text: &str, kind| vec![Seg { text: text.into(), kind }];
+            return (self.view == View::List).then(|| Bar { left: seg(self.list.mode.label(), Kind::Mode), right: seg(modified, Kind::Text) });
         }
         let viewing = self.viewing();
         let alternate = if viewing.is_some() { self.alt } else { self.last };
         let terms = self
-            .terms
+            .mux
+            .terms()
             .iter()
             .map(|t| Entry {
                 name: &t.name,
@@ -815,7 +742,8 @@ impl App {
             View::Normal(_) => self.normal.mode.label(),
             View::Insert(_) => "-- TERMINAL --",
         };
-        let info = Info { mode, modified: self.list.modified(), terms };
+        let workflow = self.workflow.as_deref().unwrap_or_default();
+        let info = Info { mode, modified: self.list.modified(), workflow, terms };
         Some(Bar { left: status.left.expand(&info), right: status.right.expand(&info) })
     }
 
@@ -833,7 +761,7 @@ impl App {
         if let Some(p) = &self.picker {
             // typing keeps what you were looking at; moving the selection previews it
             let shown = if p.browsing { p.selection() } else { self.viewing() };
-            let preview = shown.and_then(|id| self.terms.iter().find(|t| t.id == id));
+            let preview = shown.and_then(|id| self.mux.get(id));
             terminal.draw(|f| {
                 match (preview, &bar) {
                     (Some(t), bar) => render::term(f, t.vt.screen(), None, bar.as_ref()),
@@ -854,7 +782,7 @@ impl App {
             }
             View::Normal(id) => {
                 let top = self.normal.top;
-                let t = self.terms.iter_mut().find(|t| t.id == id).expect("checked above");
+                let t = self.mux.get_mut(id).expect("checked above");
                 let screen = t.vt.screen_mut();
                 let total = vt::history(screen);
                 screen.set_scrollback(total.saturating_sub(top));
@@ -865,7 +793,7 @@ impl App {
                 self.mouse_modes(Modes::default())
             }
             View::Insert(id) => {
-                let t = self.terms.iter().find(|t| t.id == id).expect("checked above");
+                let t = self.mux.get(id).expect("checked above");
                 terminal.draw(|f| render::term(f, t.vt.screen(), None, bar.as_ref()))?;
                 let modes = vt::modes(&t.vt);
                 if modes.mouse == 0 { self.mouse_modes(modes) } else { modes }
@@ -882,16 +810,6 @@ impl App {
             self.outer = Some(modes);
         }
         Ok(())
-    }
-}
-
-/// `path` with the home directory as `~`.
-fn tilde(path: &Path) -> String {
-    let home = std::env::var_os("HOME").map(PathBuf::from);
-    match home.as_deref().and_then(|h| path.strip_prefix(h).ok()) {
-        Some(rest) if rest.as_os_str().is_empty() => "~".into(),
-        Some(rest) => format!("~/{}", rest.display()),
-        None => path.display().to_string(),
     }
 }
 

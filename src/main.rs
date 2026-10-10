@@ -10,6 +10,7 @@ mod keyspec;
 mod listdiff;
 mod log;
 mod motion;
+mod mux;
 mod picker;
 mod proc;
 mod pty;
@@ -19,6 +20,7 @@ mod session;
 mod state;
 mod status;
 mod vt;
+mod workflow;
 
 use std::io::{self, Write};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
@@ -36,10 +38,11 @@ use session::Session;
 // events handled before a redraw, so a flooding program can't starve the screen
 const BATCH: usize = 256;
 
-const USAGE: &str = "usage: vix [-r | --resume]";
+const USAGE: &str = "usage: vix [-r | --resume] [workflow]";
 
 fn main() -> Result<()> {
     let mut resume = false;
+    let mut name: Option<String> = None;
     for arg in std::env::args().skip(1) {
         match arg.as_str() {
             "-r" | "--resume" => resume = true,
@@ -47,10 +50,20 @@ fn main() -> Result<()> {
                 println!("{USAGE}");
                 return Ok(());
             }
-            _ => bail!("unknown argument {arg}\n{USAGE}"),
+            _ if arg.starts_with('-') || name.is_some() => bail!("unknown argument {arg}\n{USAGE}"),
+            _ => name = Some(arg),
         }
     }
-    let session = if resume { session::load()? } else { Session::default() };
+    let mut new_workflow = None;
+    let session = match &name {
+        Some(_) if resume => bail!("--resume and a workflow can't be used together\n{USAGE}"),
+        Some(name) => workflow::load(name)?.unwrap_or_else(|| {
+            new_workflow = Some(format!("\"{name}\" [New]"));
+            Session::default()
+        }),
+        None if resume => session::load()?,
+        None => Session::default(),
+    };
     let (config, config_error) = config::load();
 
     let (tx, rx) = mpsc::channel();
@@ -65,9 +78,9 @@ fn main() -> Result<()> {
 
     let mut terminal = ratatui::try_init()?;
     let size = terminal.size()?;
-    let result = App::new(tx, size.width, size.height, config, session).and_then(|mut app| {
-        if let Some(e) = config_error {
-            app.message(e);
+    let result = App::new(tx, size.width, size.height, config, session, name).and_then(|mut app| {
+        if let Some(msg) = config_error.or(new_workflow) {
+            app.message(msg);
         }
         run(app, &mut terminal, rx)
     });

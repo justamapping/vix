@@ -16,10 +16,13 @@ pub struct Session {
     pub terms: Vec<Saved>,
 }
 
-#[derive(Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Saved {
     pub name: String,
     pub cwd: PathBuf,
+    /// typed into the shell once it starts, e.g. a workflow's `npm run dev`
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cmd: Option<String>,
     /// a `dump`, kept beside the toml as `last/<index>.out`
     #[serde(skip)]
     pub output: Vec<u8>,
@@ -32,6 +35,12 @@ pub fn path() -> Option<PathBuf> {
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/state")))?;
     Some(base.join("vix/last.toml"))
+}
+
+impl Saved {
+    pub fn new(name: impl Into<String>, cwd: impl Into<PathBuf>) -> Self {
+        Self { name: name.into(), cwd: cwd.into(), cmd: None, output: Vec::new() }
+    }
 }
 
 pub fn save(session: &Session) -> Result<()> {
@@ -76,8 +85,8 @@ mod tests {
         let s = Session {
             cursor: 1,
             terms: vec![
-                Saved { name: "web".into(), cwd: "/tmp/web".into(), output: Vec::new() },
-                Saved { name: "api".into(), cwd: "/tmp".into(), output: Vec::new() },
+                Saved::new("web", "/tmp/web"),
+                Saved::new("api", "/tmp"),
             ],
         };
         let text = toml::to_string(&s).unwrap();
@@ -96,7 +105,7 @@ mod tests {
     fn output_beside_the_toml() {
         let dir = std::env::temp_dir().join(format!("vix-session-{}", std::process::id()));
         let path = dir.join("last.toml");
-        let term = |name: &str, output: &[u8]| Saved { name: name.into(), cwd: "/".into(), output: output.to_vec() };
+        let term = |name: &str, output: &[u8]| Saved { output: output.to_vec(), ..Saved::new(name, "/") };
         save_to(&path, &Session { cursor: 0, terms: vec![term("a", b"x"), term("b", b""), term("c", b"z")] }).unwrap();
         assert!(dir.join("last/2.out").exists() && !dir.join("last/1.out").exists());
         save_to(&path, &Session { cursor: 0, terms: vec![term("c", b"z")] }).unwrap();

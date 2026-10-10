@@ -53,6 +53,8 @@ pub enum Effect {
     Rename(String),
     /// `:e name` views the terminal called `name`, spawning it if there is none; `:new name` always spawns
     Edit { name: String, new: bool },
+    /// the list's `:w name` writes, then saves the list as that workflow
+    Save(String),
 }
 
 #[derive(Debug, Clone)]
@@ -163,29 +165,34 @@ impl Buffer {
         self.clamp();
     }
 
-    /// Drops lines of a terminal that no longer exists, edits or not.
-    pub fn remove_id(&mut self, id: u64) {
-        self.lines.retain(|l| l.id != Some(id));
-        self.saved.retain(|l| l.id != Some(id));
+    /// Moves the saved list to `current` (exits, spawns, renames from elsewhere), keeping unsaved edits: lines of
+    /// terminals that are gone go, new terminals are added at the end, and renames apply to lines not edited.
+    pub fn rebase(&mut self, current: Vec<Line>) {
+        if !self.modified() {
+            return self.refresh(current);
+        }
+        let old = std::mem::take(&mut self.saved);
+        self.lines.retain(|l| l.id.is_none() || current.iter().any(|c| c.id == l.id));
+        for c in &current {
+            match old.iter().find(|o| o.id == c.id) {
+                Some(o) => {
+                    for l in self.lines.iter_mut().filter(|l| l.id == c.id && l.text == o.text) {
+                        l.text = c.text.clone();
+                    }
+                }
+                None => self.lines.push(c.clone()),
+            }
+        }
+        self.saved = current;
         if self.lines.is_empty() {
             self.lines.push(Line { id: None, text: String::new() });
         }
         self.clamp();
     }
 
-    /// Adds a line that is already saved, keeping any unsaved edits.
-    pub fn push_saved(&mut self, line: Line) {
-        self.saved.push(line.clone());
-        self.lines.push(line);
-    }
-
-    /// Renames a terminal's saved line, and its unsaved one unless that was edited.
-    pub fn rename_id(&mut self, id: u64, from: &str, to: &str) {
-        for l in self.lines.iter_mut().chain(self.saved.iter_mut()) {
-            if l.id == Some(id) && l.text == from {
-                l.text = to.into();
-            }
-        }
+    /// The terminals the unsaved edits started from.
+    pub fn base(&self) -> Vec<u64> {
+        self.saved.iter().filter_map(|l| l.id).collect()
     }
 
     pub fn modified(&self) -> bool {
@@ -742,6 +749,12 @@ impl Buffer {
                 return vec![];
             }
             ("r" | "rename", _) if self.readonly => return vec![Effect::Rename(arg.into())],
+            ("w" | "write", "") => {}
+            ("w" | "write", _) if self.readonly => {
+                self.message = Some("E45: 'readonly' option is set".into());
+                return vec![];
+            }
+            ("w" | "write", _) => return vec![Effect::Save(arg.into())],
             _ => {}
         }
         match cmd {
@@ -887,6 +900,7 @@ mod tests {
     fn ex_commands() {
         let mut b = buf(&["foo"]);
         assert_eq!(feed(&mut b, ":w\r"), vec![Effect::Write]);
+        assert_eq!(feed(&mut b, ":w web \r"), vec![Effect::Save("web".into())]);
         assert_eq!(feed(&mut b, ":x\r"), vec![Effect::Write, Effect::Quit { force: false }]);
         assert_eq!(feed(&mut b, ":e!\r"), vec![Effect::Reload]);
         feed(&mut b, "dd");
@@ -973,16 +987,34 @@ mod tests {
         assert!(list.message.as_deref().unwrap().starts_with("E492"));
     }
 
+    fn lines(names: &[(u64, &str)]) -> Vec<Line> {
+        names.iter().map(|&(id, text)| Line { id: Some(id), text: text.into() }).collect()
+    }
+
     #[test]
-    fn rename_id_keeps_unsaved_edits() {
+    fn rebase_renames_unedited_lines() {
         let mut b = buf(&["foo", "bar"]);
-        b.rename_id(0, "foo", "web");
+        b.rebase(lines(&[(0, "web"), (1, "bar")]));
         assert_eq!(ids(&b), vec![(Some(0), "web"), (Some(1), "bar")]);
         assert!(!b.modified());
         feed(&mut b, "jcwbaz\x1b");
-        b.rename_id(1, "bar", "api");
+        b.rebase(lines(&[(0, "web"), (1, "api")]));
         assert_eq!(ids(&b), vec![(Some(0), "web"), (Some(1), "baz")]);
         assert_eq!(b.saved[1].text, "api");
+    }
+
+    #[test]
+    fn rebase_adds_and_drops_terminals_keeping_edits() {
+        let mut b = buf(&["foo", "bar"]);
+        feed(&mut b, "yyGpcwfoo2\x1b");
+        b.rebase(lines(&[(1, "bar"), (2, "agent")]));
+        assert_eq!(ids(&b), vec![(Some(1), "bar"), (Some(2), "agent")]);
+        assert_eq!(b.base(), [1, 2]);
+        assert!(!b.modified());
+        feed(&mut b, "oweb\x1b");
+        b.rebase(lines(&[(2, "agent"), (3, "logs")]));
+        assert_eq!(ids(&b), vec![(Some(2), "agent"), (None, "web"), (Some(3), "logs")]);
+        assert!(b.modified());
     }
 
     #[test]
@@ -1066,15 +1098,6 @@ mod tests {
         b.wheel(false);
         assert!(!b.at_bottom());
         assert_eq!((b.top, b.cursor.0), (12, 16));
-    }
-
-    #[test]
-    fn remove_id_keeps_edits() {
-        let mut b = buf(&["foo", "bar"]);
-        feed(&mut b, "oweb\x1b");
-        b.remove_id(0);
-        assert_eq!(ids(&b), vec![(None, "web"), (Some(1), "bar")]);
-        assert!(b.modified());
     }
 
     #[test]
