@@ -88,6 +88,10 @@ needed, built from:
 
 Its test is a round trip: fill a parser, replay `exact` into a fresh one, and assert they match.
 
+Done in 3a. One gap: vt100 keeps the scroll region, origin mode, and saved cursor private, so `exact` can't copy
+them. A program that set a scroll region (vim does) can draw wrong on the replica until it redraws. That's why the
+resize nudge after attach (see risks) is required, not optional.
+
 **No request/reply waits.** The client never blocks on the server. Things that need a result, like `:e logs` then
 opening it, or `<CR>` on a modified list then opening that row, send the action with an "open" hint. The server
 answers with the new list plus `open: id`, in order on the same stream, and the client opens it when it arrives.
@@ -227,7 +231,7 @@ Once servers exist, the harness must also kill the session on drop, since killin
 | step | what | test |
 |---|---|---|
 | 3-0 | (done, `tests/ui.rs`) regression suite: today's `drive.rs` flows (`:w` ops, `:e :r :d`, exits under edits, picker, workflows, `-r`, bar overflow) recorded as expected screens against single-process vix | must still pass after 3e: userspace unchanged |
-| 3a | `dump::exact`: scrollback, screens, alternate screen, cursor, modes | round trip into a fresh parser, cell for cell |
+| 3a | (done) `dump::exact`: scrollback, screens, alternate screen, cursor, modes | round trip into a fresh parser, cell for cell |
 | 3b | `protocol.rs`: the enums, NDJSON read/write | encode/decode round trip, base64 bytes |
 | 3c | `sock.rs`: socket dir, session names, stale sockets, `-l` info, starting the server | temp dir: naming, stale removal |
 | 3d | `server.rs`: `vix --server`, accept, the loop over `Mux`, every `Request` | a test client on a temp socket: Hello, type `echo hi`, read it back, Kill, KillSession |
