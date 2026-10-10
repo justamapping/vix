@@ -1,0 +1,17 @@
+---
+source: tests/ui.rs
+expression: vix.screen()
+---
+web
+web
+api
+~
+~
+~
+~
+~
+~
+~
+~
+                                        1 web  2 web  3 api
+[cursor 2,0]

@@ -1,0 +1,17 @@
+---
+source: tests/ui.rs
+expression: vix.screen()
+---
+echo from-cmd
+$ echo from-cmd
+from-cmd
+$
+
+
+
+
+
+
+
+-- TERMINAL --                                        1 dev
+[cursor 3,2]

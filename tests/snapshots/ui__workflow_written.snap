@@ -1,0 +1,17 @@
+---
+source: tests/ui.rs
+expression: vix.screen()
+---
+web
+api
+~
+~
+~
+~
+~
+~
+~
+~
+~
+"demo" 2 terminals written                     1 web  2 api
+[cursor 1,2]

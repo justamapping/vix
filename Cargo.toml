@@ -16,3 +16,7 @@ signal-hook = "0.3"
 toml = "1.1.7"
 unicode-width = "0.2"
 vt100 = "0.16.2"
+
+[dev-dependencies]
+insta = "1.49.0"
+tempfile = "3.27.0"

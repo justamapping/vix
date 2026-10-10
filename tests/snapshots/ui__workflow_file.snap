@@ -1,0 +1,13 @@
+---
+source: tests/ui.rs
+expression: "read(&home.path(\"config/vix/workflows/demo.toml\"))"
+---
+cursor = 1
+
+[[term]]
+name = "web"
+cwd = "~/work"
+
+[[term]]
+name = "api"
+cwd = "~/work"

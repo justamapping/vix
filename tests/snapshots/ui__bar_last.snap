@@ -1,0 +1,13 @@
+---
+source: tests/ui.rs
+expression: vix.screen()
+---
+$
+
+
+
+
+
+
+-- TERMINAL --    < 4 api  5 api  6 api
+[cursor 0,2]

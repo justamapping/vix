@@ -1,0 +1,17 @@
+---
+source: tests/ui.rs
+expression: vix.screen()
+---
+keep
+~
+~
+~
+~
+~
+~
+~
+~
+~
+~
+                                                     1 keep
+[cursor 0,0]

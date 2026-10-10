@@ -1,0 +1,17 @@
+---
+source: tests/ui.rs
+expression: vix.screen()
+---
+Untitled
+api
+~
+~
+~
+~
+~
+~
+~
+~
+~
+E37: No write since last change (add ! to override)Untitled
+[cursor 1,2]

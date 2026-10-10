@@ -1,0 +1,17 @@
+---
+source: tests/ui.rs
+expression: vix.screen()
+---
+web
+api
+logs
+~
+~ ┌ terminals ───────────────────────────────────────────┐
+~ │> ap                                                  │
+~ │>  2  api   ~/work                                    │
+~ └───────────────────────────────────────────────── 1/3 ┘
+~
+~
+~
+                                       1 web  2 api  3 logs
+[cursor 5,7]

@@ -160,7 +160,7 @@ Each one ships on its own.
 1. ~~**mux**~~ (done): move terminal ownership out of `App` into `mux.rs` (list, spawn, kill, reconcile, io, flags, events).
    `App` uses it in-process. No behavior change.
 2. ~~**3-way diff**~~ (done) in `listdiff`, and `Buffer::rebase` for the staged list on list changes.
-3. **server/client**: `vix --server`, attach via dump + stream, detach on hangup and the detach command.
+3. **server/client**: `vix --server`, attach via dump + stream, detach on hangup and `:qd`. Detailed in server.md.
 4. **ctl**: ls, new, kill, rename, send, read, wait, apply, save.
 5. **sessions are workflows**: `vix web` attaches or starts, `vix -d web` starts detached.
 6. **shell integration**: OSC 133, `run`, `wait --prompt`, prompt jumps, running command in the list.

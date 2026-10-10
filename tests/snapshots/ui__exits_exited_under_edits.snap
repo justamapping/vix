@@ -1,0 +1,17 @@
+---
+source: tests/ui.rs
+expression: vix.screen()
+---
+foo
+api
+~
+~
+~
+~
+~
+~
+~
+~
+~
+logs exited                          [+]  1 Untitled  2 api
+[cursor 1,0]
