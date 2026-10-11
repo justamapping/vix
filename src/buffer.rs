@@ -2,10 +2,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::carry::Spot;
 use crate::input::Key;
-use crate::keymap::{self, Action, Cmd, InsertAt, Motion, Operator, Parsed, Scroll, Target};
+use crate::keymap::{self, Action, Cmd, InsertAt, Motion, Operator, Parsed, Scroll, Target, TextObj};
 use crate::motion::{self, Pos};
 use crate::prompt::{Change, Field};
 use crate::remap::{self, Map};
+use crate::textobj::{self, Span};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Line {
@@ -376,12 +377,16 @@ impl Buffer {
 
     fn visual_motion(&mut self, key: Key) -> Vec<Effect> {
         self.pending.push(key);
-        match keymap::parse(&self.pending) {
+        match keymap::parse_visual(&self.pending) {
             Parsed::Pending => return vec![],
             Parsed::Done(cmd)
                 if matches!(
                     cmd.action,
-                    Action::Move(_) | Action::Scroll(_) | Action::SearchNext { .. } | Action::RepeatFind { .. }
+                    Action::Move(_)
+                        | Action::Scroll(_)
+                        | Action::SearchNext { .. }
+                        | Action::RepeatFind { .. }
+                        | Action::Select(_)
                 ) =>
             {
                 self.pending.clear();
@@ -409,12 +414,15 @@ impl Buffer {
             }
             Action::Operate(Operator::Yank, target) => return self.operate(Operator::Yank, target, count),
             Action::Insert(at) if self.readonly => return vec![Effect::Insert(self.spot(at))],
-            Action::Operate(..) | Action::Paste { .. } if self.readonly => {
+            Action::Operate(..) | Action::Paste { .. } | Action::Replace(_) | Action::ToggleCase if self.readonly => {
                 return self.change_input(None, |b| _ = b.run(Cmd { count, action }));
             }
             Action::Operate(op, target) => return self.operate(op, target, count),
             Action::Insert(at) => self.start_insert(at),
             Action::Paste { before } => self.paste(before, n),
+            Action::Replace(ch) => self.replace(ch, n),
+            Action::ToggleCase => self.toggle_case(n),
+            Action::Select(obj) => self.select(obj, n),
             Action::Undo => self.restore(true),
             Action::Redo => self.restore(false),
             Action::Open => return vec![Effect::Open(self.cursor.0)],
@@ -539,6 +547,14 @@ impl Buffer {
         let (row, col) = self.cursor;
         let n = count.unwrap_or(1).max(1);
         let linewise = match target {
+            Target::Object(obj) => {
+                match textobj::select(&self.texts(), self.cursor, obj, n) {
+                    Some(Span::Chars(start, end)) => self.operate_span(op, start, end),
+                    Some(Span::Lines(r0, r1)) => self.operate_lines(op, r0, r1),
+                    None => return vec![],
+                }
+                return self.yanked(op);
+            }
             Target::Line => Some((row, (row + n - 1).min(self.lines.len() - 1))),
             Target::Motion(m) if m.linewise() => {
                 let to = motion::apply(&self.texts(), self.cursor, m, count).0;
@@ -601,6 +617,56 @@ impl Buffer {
         self.yanked(op)
     }
 
+    /// `viw`, `vap`, ...: selects the object, switching to linewise visual for lines and charwise for chars.
+    fn select(&mut self, obj: TextObj, n: usize) {
+        match textobj::select(&self.texts(), self.cursor, obj, n) {
+            Some(Span::Chars(start, (row, col))) if start != (row, col) => {
+                self.mode = Mode::Visual { line: false };
+                self.anchor = start;
+                self.cursor = if col > 0 { (row, col - 1) } else { (row - 1, char_len(&self.lines[row - 1].text)) };
+            }
+            Some(Span::Lines(r0, r1)) => {
+                self.mode = Mode::Visual { line: true };
+                (self.anchor, self.cursor) = ((r0, 0), (r1, 0));
+            }
+            _ => {}
+        }
+    }
+
+    /// `r`: replaces `n` chars from the cursor, or nothing if the line is shorter.
+    fn replace(&mut self, ch: char, n: usize) {
+        let (row, col) = self.cursor;
+        if col + n > char_len(&self.lines[row].text) {
+            return;
+        }
+        self.snapshot();
+        let text = &mut self.lines[row].text;
+        *text = text.chars().enumerate().map(|(i, c)| if (col..col + n).contains(&i) { ch } else { c }).collect();
+        self.cursor.1 = col + n - 1;
+    }
+
+    /// `~`: flips the case of `n` chars from the cursor and moves past them.
+    fn toggle_case(&mut self, n: usize) {
+        let (row, col) = self.cursor;
+        let len = char_len(&self.lines[row].text);
+        if col >= len {
+            return;
+        }
+        self.snapshot();
+        let end = (col + n).min(len);
+        let text = &mut self.lines[row].text;
+        *text = text
+            .chars()
+            .enumerate()
+            .flat_map(|(i, c)| match (col..end).contains(&i) {
+                true if c.is_uppercase() => c.to_lowercase().collect::<Vec<_>>(),
+                true => c.to_uppercase().collect(),
+                false => vec![c],
+            })
+            .collect();
+        self.cursor.1 = end;
+    }
+
     /// Runs `edit` on a one-line copy of the program's input when the cursor, and `anchor` if any, are on it; anywhere
     /// else view n is read-only.
     fn change_input(&mut self, anchor: Option<Pos>, edit: impl FnOnce(&mut Buffer)) -> Vec<Effect> {
@@ -615,6 +681,14 @@ impl Buffer {
         b.clamp();
         self.register = b.register.take();
         let (new, new_cursor) = b.flat();
+        // the next edit builds on this one before the program redraws
+        let row = field.at[0].0;
+        if let Some(text) = self.lines.get(row).and_then(|l| field.redraw(&l.text, &new)) {
+            self.lines[row].text = text;
+        }
+        let after = field.after(&new, new_cursor);
+        self.cursor = after.at[new_cursor];
+        self.input = Some(after);
         let change = Change { old: field.text, cursor: field.cursor, new, new_cursor };
         vec![Effect::Change { change, insert: b.mode == Mode::Insert }]
     }
@@ -1099,19 +1173,82 @@ mod tests {
         vec![Effect::Change { change, insert }]
     }
 
+    /// One edit on a fresh view of `input`.
+    fn edit(input: &str, keys: &str) -> Vec<Effect> {
+        feed(&mut prompt_view(input), keys)
+    }
+
     #[test]
     fn operators_edit_the_input() {
         let s = "echo hello world";
+        assert_eq!(edit(s, "dw"), change(s, "hello world", 0, false));
+        assert_eq!(edit(s, "x"), change(s, "cho hello world", 0, false));
+        assert_eq!(edit(s, "wcw"), change(s, "echo  world", 5, true));
+        assert_eq!(edit(s, "wD"), change(s, "echo ", 4, false));
+        assert_eq!(edit(s, "$x"), change(s, "echo hello worl", 14, false));
+        assert_eq!(edit(s, "dd"), change(s, "", 0, false));
+        assert_eq!(edit(s, "S"), change(s, "", 0, true));
         let mut b = prompt_view(s);
-        assert_eq!(feed(&mut b, "dw"), change(s, "hello world", 0, false));
-        assert_eq!(feed(&mut b, "x"), change(s, "cho hello world", 0, false));
-        assert_eq!(feed(&mut b, "wcw"), change(s, "echo  world", 5, true));
-        assert_eq!(feed(&mut b, "D"), change(s, "echo ", 4, false));
-        assert_eq!(feed(&mut b, "$x"), change(s, "echo hello worl", 14, false));
-        assert_eq!(feed(&mut b, "dd"), change(s, "", 0, false));
-        assert_eq!(feed(&mut b, "S"), change(s, "", 0, true));
-        assert_eq!(feed(&mut b, "0wvlld"), change(s, "o hello world", 0, false));
-        assert_eq!(b.cursor, (1, 4));
+        assert_eq!(feed(&mut b, "0wlvlld"), change(s, "e hello world", 1, false));
+        assert_eq!(b.cursor, (1, 3));
+    }
+
+    #[test]
+    fn edits_build_on_the_last_before_the_program_redraws() {
+        let mut b = prompt_view("echo hi");
+        let changes: Vec<_> = feed(&mut b, "$xxx")
+            .into_iter()
+            .map(|e| match e {
+                Effect::Change { change: c, .. } => (c.old, c.cursor, c.new, c.new_cursor),
+                e => panic!("{e:?}"),
+            })
+            .collect();
+        let c = |old: &str, cursor, new: &str, new_cursor| (old.to_string(), cursor, new.to_string(), new_cursor);
+        assert_eq!(changes, vec![c("echo hi", 7, "echo h", 5), c("echo h", 5, "echo ", 4), c("echo ", 4, "echo", 3)]);
+        assert_eq!(b.cursor, (1, 5));
+    }
+
+    #[test]
+    fn text_objects_in_the_list() {
+        let mut b = buf(&["web (dev)", "", "db", "logs"]);
+        feed(&mut b, "wwdi(");
+        assert_eq!(ids(&b)[0], (Some(0), "web ()"));
+        feed(&mut b, "jjdap");
+        assert_eq!(ids(&b), vec![(Some(0), "web ()")]);
+        feed(&mut b, "uuggciwapi\x1b");
+        assert_eq!(ids(&b), vec![(Some(0), "api (dev)"), (Some(1), ""), (Some(2), "db"), (Some(3), "logs")]);
+        assert_eq!(feed(&mut b, "Gvipy"), vec![Effect::Yank("db\nlogs\n".into())]);
+        assert_eq!(feed(&mut b, "ggviwy"), vec![Effect::Yank("api".into())]);
+    }
+
+    #[test]
+    fn replace_and_toggle_case() {
+        let mut b = buf(&["foo"]);
+        feed(&mut b, "rF");
+        assert_eq!(b.lines[0].text, "Foo");
+        feed(&mut b, "5rx");
+        assert_eq!(b.lines[0].text, "Foo");
+        feed(&mut b, "~~");
+        assert_eq!((b.lines[0].text.as_str(), b.cursor), ("fOo", (0, 2)));
+        feed(&mut b, "0l2rz");
+        assert_eq!((b.lines[0].text.as_str(), b.cursor), ("fzz", (0, 2)));
+        feed(&mut b, "uuu");
+        assert_eq!(b.lines[0].text, "Foo");
+    }
+
+    #[test]
+    fn text_objects_r_and_tilde_edit_the_input() {
+        let s = r#"git commit -m "wip fix""#;
+        assert_eq!(edit(s, "f\"ci\""), change(s, r#"git commit -m """#, 15, true));
+        assert_eq!(edit(s, "wdaw"), change(s, r#"git -m "wip fix""#, 4, false));
+        assert_eq!(edit(s, "rG"), change(s, r#"Git commit -m "wip fix""#, 0, false));
+        assert_eq!(edit(s, "~"), change(s, r#"Git commit -m "wip fix""#, 1, false));
+        let mut b = prompt_view(s);
+        assert_eq!(feed(&mut b, "k~"), vec![]);
+        assert_eq!(b.message.as_deref(), Some(READONLY));
+        let mut b = view(&["run (x y)"]);
+        assert_eq!(feed(&mut b, "fxyi("), vec![Effect::Yank("x y".into())]);
+        assert_eq!(b.cursor, (0, 5));
     }
 
     #[test]
@@ -1129,6 +1266,7 @@ mod tests {
         let mut b = prompt_view("echo hello world");
         feed(&mut b, "k0yw");
         assert_eq!(feed(&mut b, "j$p"), change("echo hello world", "echo hello worlda ", 17, false));
+        let mut b = prompt_view("echo hello world");
         feed(&mut b, "kyy");
         assert_eq!(feed(&mut b, "jp"), change("echo hello world", "echo hello world\na b", 17, false));
         let mut b = prompt_view("");
@@ -1139,8 +1277,9 @@ mod tests {
     #[test]
     fn deleted_input_is_in_the_register() {
         let mut b = prompt_view("ls");
-        feed(&mut b, "x");
-        assert_eq!(feed(&mut b, "p"), change("ls", "lls", 1, false));
+        // xp swaps, since p builds on the x the program hasn't drawn yet
+        let swap = Change { old: "s".into(), cursor: 0, new: "sl".into(), new_cursor: 1 };
+        assert_eq!(feed(&mut b, "xp")[1], Effect::Change { change: swap, insert: false });
         assert_eq!(feed(&mut b, "k$p"), vec![]);
     }
 

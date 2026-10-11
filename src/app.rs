@@ -53,6 +53,8 @@ pub struct App {
     press: Option<(u16, u16)>,
     /// view n's text is behind the terminal
     stale: bool,
+    /// when view n last edited the program's input, which it trusts over the screen until the screen shows it
+    predicted: Option<Instant>,
     last: Option<u64>,
     alt: Option<u64>,
     /// list row to open once the user answers the write prompt
@@ -121,6 +123,7 @@ impl App {
             wheeled: false,
             press: None,
             stale: false,
+            predicted: None,
             last: None,
             alt: None,
             confirm: None,
@@ -210,6 +213,7 @@ impl App {
         let live = follow::live(screen);
         let lines = vt::text(screen).into_iter().map(|text| Line { id: None, text }).collect();
         self.normal.input = prompt::field(screen);
+        self.predicted = None;
         self.normal.load(lines);
         self.normal.message = None;
         self.normal.place(live.cursor, live.bottom);
@@ -219,14 +223,23 @@ impl App {
 
     fn refresh_normal(&mut self) {
         let View::Normal(id) = self.view else { return };
-        if !self.stale {
+        let expired = self.predicted.is_some_and(|at| at.elapsed() >= prompt::SETTLE);
+        if !self.stale && !expired {
             return;
         }
         self.stale = false;
         let Some(t) = self.term(id) else { return };
         let screen = t.vt.screen_mut();
         let lines = vt::text(screen).into_iter().map(|text| Line { id: None, text }).collect();
-        self.normal.input = prompt::field(screen);
+        let shown = prompt::field(screen);
+        let caught_up = match (&shown, &self.normal.input) {
+            (Some(a), Some(b)) => a.same(b),
+            _ => false,
+        };
+        if self.predicted.is_none() || caught_up || expired {
+            self.normal.input = shown;
+            self.predicted = None;
+        }
         self.normal.refresh(lines);
     }
 
@@ -330,7 +343,8 @@ impl App {
                 let after = follow::live(t.vt.screen_mut());
                 if normal {
                     self.stale = true;
-                    if self.normal.mode == buffer::Mode::Normal {
+                    // an edit in flight already put the cursor where the program's will be
+                    if self.normal.mode == buffer::Mode::Normal && self.predicted.is_none() {
                         (self.normal.cursor, self.normal.top) = follow::follow(self.normal.cursor, self.normal.top, before, after);
                     }
                 }
@@ -557,6 +571,7 @@ impl App {
                 Effect::Rename(name) => self.rename(id, name),
                 Effect::Change { change, insert } => {
                     self.remote.send(&Request::Change { id, change });
+                    self.predicted = Some(Instant::now());
                     if insert {
                         self.set_view(View::Insert(id));
                     }

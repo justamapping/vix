@@ -12,7 +12,7 @@ use crate::carry::{self, Spot};
 use crate::dump;
 use crate::listdiff::{self, Op};
 use crate::proc;
-use crate::prompt::Change;
+use crate::prompt::{Change, Typed};
 use crate::pty::Pty;
 use crate::session::Saved;
 use crate::vt;
@@ -40,6 +40,8 @@ pub struct Term {
     pub activity: bool,
     pub bell: bool,
     quiet: Instant,
+    /// the input the last change typed will leave, so the next one can build on it before the program redraws
+    typed: Option<Typed>,
 }
 
 impl Term {
@@ -49,6 +51,7 @@ impl Term {
     }
 
     pub fn write(&mut self, bytes: &[u8]) -> Result<()> {
+        self.typed = None;
         self.pty.write(bytes)
     }
 
@@ -89,11 +92,15 @@ impl Term {
         Ok(())
     }
 
-    /// Types `change` into a line editor, if its screen still shows the input the change was made from. Returns
-    /// whether it did.
+    /// Types `change` into a line editor, if its screen still shows the input the change was made from, or the last
+    /// change will leave it there. Returns whether it did.
     pub fn change(&mut self, change: &Change) -> Result<bool> {
-        let keys = self.raw().then(|| change.keys(self.vt.screen(), vt::modes(&self.vt))).flatten();
-        keys.map(|keys| self.write(&keys)).transpose().map(|done| done.is_some())
+        let typed = self.typed.take();
+        let keys = self.raw().then(|| change.keys(self.vt.screen(), vt::modes(&self.vt), typed.as_ref())).flatten();
+        let Some(keys) = keys else { return Ok(false) };
+        self.write(&keys)?;
+        self.typed = Some(change.typed());
+        Ok(true)
     }
 
     /// Clears activity and bell, now that it's been seen.
@@ -155,7 +162,7 @@ impl<E: From<PtyEvent> + Send + 'static> Mux<E> {
         let pty = Pty::spawn(self.cols, self.rows, &cwd, &env)?;
         pump(pty.reader()?, self.tx.clone(), move |b| PtyEvent::Output(id, b).into(), PtyEvent::Exited(id).into());
         let vt = vt::parser(self.cols, self.rows);
-        Ok(Term { id, name, cwd, cmd: None, pty, vt, activity: false, bell: false, quiet: Instant::now() + SPAWN_QUIET })
+        Ok(Term { id, name, cwd, cmd: None, pty, vt, activity: false, bell: false, quiet: Instant::now() + SPAWN_QUIET, typed: None })
     }
 
     /// Starts a terminal at the end of the list, replaying saved output and typing `cmd` into it.

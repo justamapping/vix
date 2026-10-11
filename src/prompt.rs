@@ -1,9 +1,14 @@
+use std::time::{Duration, Instant};
+
 use serde::{Deserialize, Serialize};
 use vt100::{Cell, Color, Screen};
 
 use crate::carry::arrow;
 use crate::motion::Pos;
 use crate::vt::{self, Modes};
+
+/// How long an edit vix made is trusted over a screen that doesn't show it yet.
+pub const SETTLE: Duration = Duration::from_millis(500);
 
 /// Last char of a prompt, when a blank follows it.
 const GLYPHS: [&str; 9] = ["$", "%", "#", ">", "❯", "›", "»", "➜", "λ"];
@@ -45,6 +50,30 @@ impl Field {
         let empty = self.text.is_empty() && pos.0 == self.at[0].0;
         self.at.iter().position(|&p| p == pos).or(empty.then_some(0))
     }
+
+    /// The input as `new` with the cursor at `cursor`, its chars drawn where the old ones were, extra ones continuing
+    /// the last row.
+    pub fn after(&self, new: &str, cursor: usize) -> Field {
+        let &(row, end) = self.at.last().expect("at ends with the input's end");
+        let at = (0..=new.chars().count()).map(|i| self.at.get(i).copied().unwrap_or_else(|| (row, end + i + 1 - self.at.len())));
+        Field { text: new.into(), cursor, at: at.collect() }
+    }
+
+    /// `line` with this input's text swapped for `new`, if both fit on the input's one row.
+    pub fn redraw(&self, line: &str, new: &str) -> Option<String> {
+        let row = self.at[0].0;
+        if self.at.iter().any(|&(r, _)| r != row) || new.contains('\n') {
+            return None;
+        }
+        let chars: Vec<char> = line.chars().collect();
+        let (start, end) = (self.at[0].1.min(chars.len()), self.at[self.at.len() - 1].1.min(chars.len()));
+        Some(chars[..start].iter().copied().chain(new.chars()).chain(chars[end..].iter().copied()).collect())
+    }
+
+    /// Shows the same input as `other`, wherever it's drawn.
+    pub fn same(&self, other: &Field) -> bool {
+        (&self.text, self.cursor) == (&other.text, other.cursor)
+    }
 }
 
 /// `input` in view n's coordinates.
@@ -66,10 +95,31 @@ pub struct Change {
 }
 
 impl Change {
-    /// The keys that make it, if `screen` still shows the input it was made from.
-    pub fn keys(&self, screen: &Screen, modes: Modes) -> Option<Vec<u8>> {
-        input(screen).filter(|i| i.text == self.old && i.cursor == self.cursor)?;
+    /// The keys that make it, if `screen` still shows the input it was made from or `typed` will leave it there.
+    pub fn keys(&self, screen: &Screen, modes: Modes, typed: Option<&Typed>) -> Option<Vec<u8>> {
+        if !typed.is_some_and(|t| t.leaves(&self.old, self.cursor)) {
+            input(screen).filter(|i| i.text == self.old && i.cursor == self.cursor)?;
+        }
         keys(&self.old, self.cursor, &self.new, self.new_cursor, modes)
+    }
+
+    /// What the program's input will be once it takes this change.
+    pub fn typed(&self) -> Typed {
+        Typed { text: self.new.clone(), cursor: self.new_cursor, at: Instant::now() }
+    }
+}
+
+/// An input that keys vix just typed will leave, before the program has redrawn it.
+#[derive(Debug)]
+pub struct Typed {
+    text: String,
+    cursor: usize,
+    at: Instant,
+}
+
+impl Typed {
+    fn leaves(&self, text: &str, cursor: usize) -> bool {
+        self.at.elapsed() < SETTLE && (self.text.as_str(), self.cursor) == (text, cursor)
     }
 }
 
@@ -309,9 +359,37 @@ pub(crate) mod tests {
         let mut p = vt::parser(20, 3);
         p.process(b"$ echo hi");
         let change = |old: &str, cursor| Change { old: old.into(), cursor, new: "echo".into(), new_cursor: 4 };
-        assert_eq!(change("echo hi", 7).keys(p.screen(), PLAIN), Some(bs(3).into_bytes()));
-        assert_eq!(change("echo ho", 7).keys(p.screen(), PLAIN), None);
-        assert_eq!(change("echo hi", 6).keys(p.screen(), PLAIN), None);
+        assert_eq!(change("echo hi", 7).keys(p.screen(), PLAIN, None), Some(bs(3).into_bytes()));
+        assert_eq!(change("echo ho", 7).keys(p.screen(), PLAIN, None), None);
+        assert_eq!(change("echo hi", 6).keys(p.screen(), PLAIN, None), None);
+    }
+
+    #[test]
+    fn a_change_builds_on_the_last_one_until_it_settles() {
+        let mut p = vt::parser(20, 3);
+        p.process(b"$ echo hi");
+        let first = Change { old: "echo hi".into(), cursor: 7, new: "echo h".into(), new_cursor: 6 };
+        let next = Change { old: "echo h".into(), cursor: 6, new: "echo ".into(), new_cursor: 5 };
+        let typed = first.typed();
+        assert_eq!(next.keys(p.screen(), PLAIN, None), None);
+        assert_eq!(next.keys(p.screen(), PLAIN, Some(&typed)), Some(bs(1).into_bytes()));
+        let old = Typed { at: Instant::now() - SETTLE, ..first.typed() };
+        assert_eq!(next.keys(p.screen(), PLAIN, Some(&old)), None);
+        assert_eq!(first.keys(p.screen(), PLAIN, Some(&typed)), Some(bs(1).into_bytes()));
+    }
+
+    #[test]
+    fn a_field_after_an_edit() {
+        let f = Field { text: "abc".into(), cursor: 3, at: vec![(4, 2), (4, 3), (5, 0), (5, 1)] };
+        let shorter = f.after("ac", 1);
+        assert_eq!((shorter.text.as_str(), shorter.cursor, &shorter.at[..]), ("ac", 1, &[(4, 2), (4, 3), (5, 0)][..]));
+        assert_eq!(f.after("abcde", 0).at[3..], [(5, 1), (5, 2), (5, 3)]);
+        assert!(f.same(&Field { at: vec![], ..f.clone() }) && !f.same(&shorter));
+        assert_eq!(f.redraw("$ abc", "x"), None);
+        let one = Field { text: "abc".into(), cursor: 3, at: vec![(0, 2), (0, 3), (0, 4), (0, 5)] };
+        assert_eq!(one.redraw("$ abc  12:00", "xabcy").as_deref(), Some("$ xabcy  12:00"));
+        assert_eq!(one.redraw("$ abc", "").as_deref(), Some("$ "));
+        assert_eq!(one.redraw("$ abc", "a\nb"), None);
     }
 
     #[test]

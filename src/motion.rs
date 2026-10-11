@@ -4,13 +4,13 @@ use crate::keymap::Motion;
 pub type Pos = (usize, usize);
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-enum Class {
+pub enum Class {
     Blank,
     Word,
     Punct,
 }
 
-fn class(c: char, big: bool) -> Class {
+pub fn class(c: char, big: bool) -> Class {
     if c.is_whitespace() {
         Class::Blank
     } else if big || c.is_alphanumeric() || c == '_' {

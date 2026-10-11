@@ -37,10 +37,27 @@ pub enum Operator {
     Change,
 }
 
+/// What `i`/`a` select after an operator or in visual mode.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Object {
+    Word,
+    BigWord,
+    Paragraph,
+    Quote(char),
+    Bracket(char, char),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TextObj {
+    pub object: Object,
+    pub inner: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Target {
     Motion(Motion),
     Line,
+    Object(TextObj),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -81,6 +98,10 @@ pub enum Action {
     SearchNext { reverse: bool },
     RepeatFind { reverse: bool },
     Visual { line: bool },
+    /// visual mode's `iw`, `a(`, ...
+    Select(TextObj),
+    Replace(char),
+    ToggleCase,
     Scroll(Scroll),
     Parent,
     Switch { back: bool },
@@ -123,6 +144,10 @@ pub fn parse(keys: &[Key]) -> Parsed {
         return match rest.first() {
             None => Parsed::Pending,
             Some(&k) if k == first => Parsed::Done(Cmd { count, action: Action::Operate(op, Target::Line) }),
+            Some(Key::Char('i' | 'a')) => match object(rest) {
+                Ok(obj) => Parsed::Done(Cmd { count, action: Action::Operate(op, Target::Object(obj)) }),
+                Err(p) => p,
+            },
             Some(_) => match motion(rest) {
                 Parsed::Done(Cmd { action: Action::Move(m), .. }) => {
                     Parsed::Done(Cmd { count, action: Action::Operate(op, Target::Motion(m)) })
@@ -146,6 +171,12 @@ pub fn parse(keys: &[Key]) -> Parsed {
         Key::Char('A') => done(Action::Insert(InsertAt::LineEnd)),
         Key::Char('o') => done(Action::Insert(InsertAt::Below)),
         Key::Char('O') => done(Action::Insert(InsertAt::Above)),
+        Key::Char('r') => match rest.get(1) {
+            None => Parsed::Pending,
+            Some(Key::Char(c)) => done(Action::Replace(*c)),
+            Some(_) => Parsed::Invalid,
+        },
+        Key::Char('~') => done(Action::ToggleCase),
         Key::Char('p') => done(Action::Paste { before: false }),
         Key::Char('P') => done(Action::Paste { before: true }),
         Key::Char('u') => done(Action::Undo),
@@ -181,9 +212,41 @@ pub fn parse(keys: &[Key]) -> Parsed {
     }
 }
 
-/// The next key is a literal argument (the target of `f` `t`), which mappings leave alone.
+/// Visual mode adds text objects to normal mode's keys.
+pub fn parse_visual(keys: &[Key]) -> Parsed {
+    let (count, rest) = count(keys);
+    match rest.first() {
+        Some(Key::Char('i' | 'a')) => match object(rest) {
+            Ok(obj) => Parsed::Done(Cmd { count, action: Action::Select(obj) }),
+            Err(p) => p,
+        },
+        _ => parse(keys),
+    }
+}
+
+/// `i` or `a` and the object's key.
+fn object(keys: &[Key]) -> Result<TextObj, Parsed> {
+    let inner = keys[0] == Key::Char('i');
+    let Some(Key::Char(c)) = keys.get(1) else {
+        return Err(if keys.len() == 1 { Parsed::Pending } else { Parsed::Invalid });
+    };
+    let object = match c {
+        'w' => Object::Word,
+        'W' => Object::BigWord,
+        'p' => Object::Paragraph,
+        '"' | '\'' | '`' => Object::Quote(*c),
+        '(' | ')' | 'b' => Object::Bracket('(', ')'),
+        '[' | ']' => Object::Bracket('[', ']'),
+        '{' | '}' | 'B' => Object::Bracket('{', '}'),
+        '<' | '>' => Object::Bracket('<', '>'),
+        _ => return Err(Parsed::Invalid),
+    };
+    Ok(TextObj { object, inner })
+}
+
+/// The next key is a literal argument (the target of `f` `t` `r`), which mappings leave alone.
 pub fn awaits_char(keys: &[Key]) -> bool {
-    matches!(keys.last(), Some(Key::Char('f' | 'F' | 't' | 'T'))) && parse(keys) == Parsed::Pending
+    matches!(keys.last(), Some(Key::Char('f' | 'F' | 't' | 'T' | 'r'))) && parse(keys) == Parsed::Pending
 }
 
 fn count(keys: &[Key]) -> (Option<usize>, &[Key]) {
@@ -288,6 +351,31 @@ mod tests {
         assert_eq!(p("3J"), done(Some(3), Action::Switch { back: false }));
         assert_eq!(parse(&[Key::Ctrl('^')]), done(None, Action::Alternate));
         assert_eq!(parse(&[Key::Ctrl('p')]), done(None, Action::Pick));
+    }
+
+    #[test]
+    fn text_objects() {
+        let obj = |object, inner| TextObj { object, inner };
+        let op = |o, t| Action::Operate(o, Target::Object(t));
+        assert_eq!(p("di"), Parsed::Pending);
+        assert_eq!(p("diw"), done(None, op(Operator::Delete, obj(Object::Word, true))));
+        assert_eq!(p("c2a("), done(Some(2), op(Operator::Change, obj(Object::Bracket('(', ')'), false))));
+        assert_eq!(p("yiB"), done(None, op(Operator::Yank, obj(Object::Bracket('{', '}'), true))));
+        assert_eq!(p("ci\""), done(None, op(Operator::Change, obj(Object::Quote('"'), true))));
+        assert_eq!(p("diz"), Parsed::Invalid);
+        assert_eq!(p("i"), done(None, Action::Insert(InsertAt::Before)));
+        let v = |s: &str| parse_visual(&s.chars().map(Key::Char).collect::<Vec<_>>());
+        assert_eq!(v("a"), Parsed::Pending);
+        assert_eq!(v("2ap"), done(Some(2), Action::Select(obj(Object::Paragraph, false))));
+        assert_eq!(v("j"), done(None, Action::Move(Motion::Down)));
+    }
+
+    #[test]
+    fn replace_and_toggle() {
+        assert_eq!(p("r"), Parsed::Pending);
+        assert_eq!(p("3rx"), done(Some(3), Action::Replace('x')));
+        assert_eq!(p("~"), done(None, Action::ToggleCase));
+        assert!(keymap_awaits("2r") && !keymap_awaits("dr"));
     }
 
     #[test]

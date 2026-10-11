@@ -48,13 +48,16 @@ any      --:qa-->    quit vix    (:q only quits from the list)
 - **workflows**: `:w name` saves the list to `~/.config/vix/workflows/name.toml`, after which `:w` keeps saving
   there. `vix name` opens one (or a new one, like `vim newfile`). Per terminal: `name`, `cwd` (`~` ok), `cmd`.
 - **prompt editing**: operators in view n edit the program's input (shells, REPLs, claude code), see below.
+- **text objects**: `iw aw iW aW ip ap`, quotes `" ' \``, brackets `( [ { <` (and `b` `B`) with counts, after
+  operators and in visual; `r`, `~`. Quotes pair up from the line's start (vim guesses from the cursor), brackets
+  don't search forward. Not yet: sentences, tags, visual `r`/`~`, extending a selection with another object.
 - **`vix ctl`**: ls, new, kill, rename, send, read, wait, apply, save, sessions, detach, kill-session. See "ctl".
 
 ## priorities
 
 1. ~~**`vix ctl`**~~ (server step 4, done)
-2. **text objects**, `r`, `~` in the vim; view n's prompt editing gets them for free
-3. **fast edits** (prompt editing step 4): `xxxx` faster than the redraw must not edit the wrong spot
+2. ~~**text objects**, `r`, `~`~~ (done, `textobj.rs`; list, view n and prompt editing share them)
+3. ~~**fast edits**~~ (prompt editing step 4, done)
 4. **shell integration**, only if its payoff is worth how opinionated it is (see "shell integration")
 
 ## next: prompt editing
@@ -113,12 +116,16 @@ vs bar) if programs set it, else document "turn off the program's vi mode".
    yanked output pastes in. The client sends a `prompt::Change` (old text and cursor, new text and cursor); the
    server types it only if its own screen still shows that input and the cursor isn't a block (the program's own vi
    normal mode), else says why. `c` and `s` end in view i. `r`, `~`, text objects and `.` wait on the vim itself
-4. typing faster than the redraw (`xxxx`): each edit is computed from the last screen. If the server's screen moved
+4. ~~typing faster than the redraw~~ (done) (`xxxx`): each edit is computed from the last screen. If the server's screen moved
    on, the edit is refused (lost keystroke); if neither has but the program took the last edit, the keys assume the
    wrong cursor (wrong edit). Remember the text and cursor an edit should produce and base the next edit on it until
    the screen shows it or a short timeout passes. Most likely in claude code, which redraws slower than zsh; test a
-   burst there first
-5. text objects, `r`, `~`: in the vim itself, nothing prompt-specific
+   burst there first. Built that way: view n draws the predicted input into its line (when it's one row) and moves
+   the cursor there, so motions and the next edit see it; the server accepts a change built on what it last typed.
+   Both trust the prediction until the screen shows it or 500ms (`prompt::SETTLE`) pass. Bursts of `x ~ r dw P` and
+   motions between them match vim in zsh, bash and claude code (drive, all keys in one write). Inputs wrapped over
+   rows are predicted as if extra text continues the last row
+5. ~~text objects, `r`, `~`~~: in the vim itself, nothing prompt-specific (done)
 
 OSC 133 would only give shells an exact input start (`B`); REPLs and claude code don't emit it and nothing marks the
 input's end, so the heuristics stay either way. Not a step here; it comes with shell integration if that happens.

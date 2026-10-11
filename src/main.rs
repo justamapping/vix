@@ -26,6 +26,7 @@ mod session;
 mod sock;
 mod state;
 mod status;
+mod textobj;
 mod vt;
 mod workflow;
 
