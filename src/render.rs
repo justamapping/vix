@@ -85,6 +85,24 @@ fn highlight(frame: &mut Frame, buf: &Buffer, top: usize, height: u16) {
     }
 }
 
+/// Paints matches of the search pattern on visible rows, like vim's Search group.
+fn matches(frame: &mut Frame, buf: &Buffer, top: usize, height: u16) {
+    let Some(pat) = buf.highlighted() else { return };
+    let width = frame.area().width;
+    let out = frame.buffer_mut();
+    for y in 0..height {
+        let Some(line) = buf.lines.get(top + y as usize) else { break };
+        let text = &line.text;
+        for (b, _) in text.match_indices(pat) {
+            let col = text[..b].chars().count();
+            let (x0, x1) = (x_of(text, col), x_of(text, col + pat.chars().count()));
+            for x in x0..x1.min(width) {
+                out[(x, y)].set_style(Style::new().fg(Color::Black).bg(Color::Yellow));
+            }
+        }
+    }
+}
+
 /// Draws the bottom row: always with a bar, else only when there's something to say.
 fn bottom(frame: &mut Frame, buf: Option<&Buffer>, bar: Option<&Bar>) {
     let area = frame.area();
@@ -129,6 +147,7 @@ pub fn list(frame: &mut Frame, buf: &Buffer, bar: &Bar) {
         })
         .collect();
     frame.render_widget(Paragraph::new(rows), area);
+    matches(frame, buf, buf.top, height);
     highlight(frame, buf, buf.top, height);
     bottom(frame, Some(buf), Some(bar));
     cursor(frame, buf, buf.top);
@@ -178,6 +197,7 @@ pub fn term(frame: &mut Frame, screen: &vt100::Screen, normal: Option<&Buffer>, 
     match normal {
         Some(buf) => {
             let top = buf.top + shift as usize;
+            matches(frame, buf, top, area.height);
             highlight(frame, buf, top, area.height);
             bottom(frame, Some(buf), bar);
             cursor(frame, buf, top);

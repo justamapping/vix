@@ -87,12 +87,20 @@ pub struct Buffer {
     /// normal and visual mode mappings
     pub maps: Vec<Map>,
     pub insert_maps: Vec<Map>,
+    /// move to the match while typing a search, like vim's 'incsearch'
+    pub incsearch: bool,
+    /// highlight the last search's matches until `:noh`, like vim's 'hlsearch'
+    pub hlsearch: bool,
     typeahead: Vec<Key>,
     anchor: Pos,
     saved: Vec<Line>,
     pending: Vec<Key>,
     register: Option<Register>,
     search: Option<(String, bool)>,
+    /// `:noh` hides the highlight until the next search
+    hidden: bool,
+    /// cursor and top when the command line opened, restored by incsearch
+    origin: (Pos, usize),
     last_find: Option<Motion>,
     undo: Vec<(Vec<Line>, Pos)>,
     redo: Vec<(Vec<Line>, Pos)>,
@@ -131,12 +139,16 @@ impl Buffer {
             height: 1,
             maps: Vec::new(),
             insert_maps: Vec::new(),
+            incsearch: true,
+            hlsearch: true,
             typeahead: Vec::new(),
             anchor: (0, 0),
             saved: Vec::new(),
             pending: Vec::new(),
             register: None,
             search: None,
+            hidden: false,
+            origin: ((0, 0), 0),
             last_find: None,
             undo: Vec::new(),
             redo: Vec::new(),
@@ -223,6 +235,20 @@ impl Buffer {
         let (keys, wait) = remap::resolve(self.active_maps(), &self.typeahead, false);
         self.typeahead = wait;
         keys.into_iter().flat_map(|k| self.press(k)).collect()
+    }
+
+    /// Back to normal from any mode, dropping pending keys, like neovim's `<C-\><C-n>`.
+    pub fn escape(&mut self) {
+        self.typeahead.clear();
+        self.press(Key::Esc);
+    }
+
+    /// The pattern whose matches are highlighted: the one being typed, else the last search.
+    pub fn highlighted(&self) -> Option<&str> {
+        if self.mode == Mode::Command && self.prompt != ':' {
+            return (self.incsearch && !self.cmdline.is_empty()).then_some(self.cmdline.as_str());
+        }
+        self.search.as_ref().filter(|_| self.hlsearch && !self.hidden).map(|(p, _)| p.as_str())
     }
 
     /// Scrolls a wheel notch, keeping the cursor on screen.
@@ -393,9 +419,11 @@ impl Buffer {
                 };
                 self.mode = Mode::Command;
                 self.cmdline.clear();
+                self.origin = (self.cursor, self.top);
             }
             Action::SearchNext { reverse } => {
                 if let Some((pat, back)) = self.search.clone() {
+                    self.hidden = false;
                     (0..n).for_each(|_| self.find(&pat, back != reverse));
                 }
             }
@@ -711,14 +739,19 @@ impl Buffer {
 
     fn command(&mut self, key: Key) -> Vec<Effect> {
         match key {
-            Key::Esc => self.mode = Mode::Normal,
-            Key::Backspace if self.cmdline.is_empty() => self.mode = Mode::Normal,
+            Key::Esc => self.cancel(),
+            Key::Backspace if self.cmdline.is_empty() => self.cancel(),
             Key::Backspace => {
                 self.cmdline.pop();
+                self.preview();
             }
-            Key::Char(c) => self.cmdline.push(c),
+            Key::Char(c) => {
+                self.cmdline.push(c);
+                self.preview();
+            }
             Key::Enter => {
                 self.mode = Mode::Normal;
+                (self.cursor, self.top) = self.origin;
                 let cmd = std::mem::take(&mut self.cmdline);
                 if self.prompt == ':' {
                     return self.ex(&cmd);
@@ -727,12 +760,29 @@ impl Buffer {
                 let pat = if cmd.is_empty() { self.search.clone().map(|(p, _)| p).unwrap_or_default() } else { cmd };
                 if !pat.is_empty() {
                     self.search = Some((pat.clone(), back));
+                    self.hidden = false;
                     self.find(&pat, back);
                 }
             }
             _ => {}
         }
         vec![]
+    }
+
+    fn cancel(&mut self) {
+        self.mode = Mode::Normal;
+        (self.cursor, self.top) = self.origin;
+    }
+
+    /// Incsearch: the cursor on the first match of what's typed so far, else back where it was.
+    fn preview(&mut self) {
+        (self.cursor, self.top) = self.origin;
+        if !self.incsearch || self.prompt == ':' {
+            return;
+        }
+        if let Some((pos, _)) = motion::search(&self.texts(), self.cursor, &self.cmdline, self.prompt == '?') {
+            self.cursor = pos;
+        }
     }
 
     fn ex(&mut self, cmd: &str) -> Vec<Effect> {
@@ -782,6 +832,10 @@ impl Buffer {
             "qd" | "detach" => vec![Effect::Detach { force: false }],
             "qd!" | "detach!" => vec![Effect::Detach { force: true }],
             "e!" => vec![Effect::Reload],
+            "noh" | "nohlsearch" => {
+                self.hidden = true;
+                vec![]
+            }
             "e" | "edit" => {
                 self.message = Some("E32: No file name".into());
                 vec![]
@@ -1045,6 +1099,56 @@ mod tests {
         assert_eq!(b.cursor, (1, 0));
         feed(&mut b, "/zzz\r");
         assert!(b.message.as_deref().unwrap().starts_with("E486"));
+    }
+
+    #[test]
+    fn incsearch_previews_and_restores() {
+        let mut b = view(&["foo", "bar", "baz"]);
+        feed(&mut b, "/ba");
+        assert_eq!(b.cursor, (1, 0));
+        assert_eq!(b.highlighted(), Some("ba"));
+        feed(&mut b, "z");
+        assert_eq!(b.cursor, (2, 0));
+        feed(&mut b, "\x1b");
+        assert_eq!(b.cursor, (0, 0));
+        feed(&mut b, "/baz\r");
+        assert_eq!(b.cursor, (2, 0));
+        b.incsearch = false;
+        feed(&mut b, "gg/ba");
+        assert_eq!(b.cursor, (0, 0));
+    }
+
+    #[test]
+    fn hlsearch_until_noh() {
+        let mut b = view(&["foo", "bar"]);
+        assert_eq!(b.highlighted(), None);
+        feed(&mut b, "/bar\r");
+        assert_eq!(b.highlighted(), Some("bar"));
+        feed(&mut b, ":noh\r");
+        assert_eq!(b.highlighted(), None);
+        feed(&mut b, "n");
+        assert_eq!(b.highlighted(), Some("bar"));
+        b.hlsearch = false;
+        assert_eq!(b.highlighted(), None);
+    }
+
+    #[test]
+    fn escape_from_any_mode() {
+        let mut b = buf(&["a", "b"]);
+        feed(&mut b, "ix");
+        b.escape();
+        assert_eq!(b.mode, Mode::Normal);
+        feed(&mut b, "Vj");
+        b.escape();
+        assert_eq!(b.mode, Mode::Normal);
+        feed(&mut b, "j/a");
+        b.escape();
+        assert_eq!((b.mode, b.cursor), (Mode::Normal, (1, 0)));
+        feed(&mut b, "d");
+        b.escape();
+        feed(&mut b, "j");
+        assert_eq!(b.cursor, (1, 0));
+        assert_eq!(b.texts(), ["xa", "b"]);
     }
 
     #[test]

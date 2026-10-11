@@ -103,6 +103,9 @@ impl App {
         let mut list = Buffer::new(Vec::new());
         list.maps = config.list.clone();
         list.insert_maps = config.list_insert.clone();
+        for b in [&mut normal, &mut list] {
+            (b.incsearch, b.hlsearch) = (config.incsearch, config.hlsearch);
+        }
         let mut app = Self {
             remote,
             name,
@@ -420,10 +423,15 @@ impl App {
                     let (next, out) = state::step(self.view, Input::Escape, self.config.escape);
                     self.remote.input(id, out);
                     self.set_view(next);
+                } else {
+                    self.normal.escape();
                 }
                 return Ok(());
             }
-            (View::List, Input::Escape) => return Ok(()),
+            (View::List, Input::Escape) => {
+                self.list.escape();
+                return Ok(());
+            }
             (_, Input::Bytes(b)) => b,
         };
         // keys go to the list or view n until one of them changes view; the rest go to the new one

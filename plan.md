@@ -41,14 +41,65 @@ any      --:qa-->    quit vix    (:q only quits from the list)
 - **view n**: read-only buffer over scrollback + screen, follows live output at the bottom, pinned elsewhere.
   Motions, visual, search, yank via OSC 52, `:r name`, `:d [name]`. Mouse: wheel scrolls into view n, drag selects.
 - **config**: `~/.config/vix/config.toml`, vim key notation, non-recursive maps per mode, `escape`, `timeoutlen`,
-  `mouse`, status templates. A broken config falls back to defaults and says why.
+  `mouse`, `incsearch`, `hlsearch` (both on, `:noh`), status templates. `<C-\>` returns to normal from any mode. A broken config falls back to defaults and says why.
 - **status bar**: vim-tabline tabs (current reversed, activity bold, bell yellow), slides around the current
   terminal when it overflows. Fields `{mode} {name} {index} {total} {modified} {workflow} {terms}`.
 - **resume**: `vix -r` restores names, live cwd (pid -> cwd like tmux), and scrollback (`dump`), not programs.
 - **workflows**: `:w name` saves the list to `~/.config/vix/workflows/name.toml`, after which `:w` keeps saving
   there. `vix name` opens one (or a new one, like `vim newfile`). Per terminal: `name`, `cwd` (`~` ok), `cmd`.
 
-## next: the server
+## next: prompt editing
+
+Vim motions and operators on whatever prompt the program in view n is showing: a shell, a REPL, claude code's input.
+Output above it stays read-only (yank still works). No snapshot, no shared buffer: the screen is the truth, vix edits
+a copy of the input and sends the difference to the program as keys. This replaces the old snapshot idea.
+
+### what was verified (drive, zsh and claude code 2.1)
+
+- both keep the real cursor on their input; arrows move it. Left past the start clamps, so overshooting left is safe
+- claude code wraps its input box itself (rows aren't vt-wrapped), which is why `I` on a second row lands on that
+  row's start today. Its box is one string though: left arrows cross rows, and each break counts as one char (the
+  space the wrap ate). A real newline (shift+enter) also counts as one, so arrow math holds either way
+
+### how
+
+1. **find the input**: the cursor's line as one string plus a map to screen cells. vt wraps join with zero chars,
+   program wraps (continuation rows indented alike, stopping at a border or blank row) with one. The program's
+   cursor is our index into it
+2. **edit it with the existing vim**: in view n, operators whose range is inside the input are allowed; everywhere
+   else stays read-only as today. `x dw ciw D p r ~`, visual, text objects as they land
+3. **send the difference**: common prefix/suffix of old and new, then arrows to the change's end, backspaces over
+   it, the new text, arrows to the new cursor. Rules: never move right past the input's end (right accepts fish and
+   zsh autosuggestions), only backspace (forward delete isn't universal), insert as bracketed paste when the
+   program enabled it, else refuse newlines (a raw newline runs the command), count graphemes
+4. **the program redraws**, view n refreshes, and a wrong guess corrects itself. The prompt string (`$ `) inside the
+   "input" is harmless: shells refuse to move or delete into it. `c` and `s` delete, then enter view i
+
+### where it works
+
+| kind | examples | |
+|---|---|---|
+| line editors | zsh, bash, fish, python, psql, node | solid. risks: autosuggestion ghost text, `RPROMPT` |
+| main-screen input boxes | claude code (verified), likely codex, gemini | the continuation-row heuristic |
+| full screen | nvim, less, htop | off (alternate screen); they have their own modes |
+| no line editor | `cat`, `read` | arrows print junk; rare, accepted |
+
+Programs with their own vi mode (claude code's `editorMode: vim`, zsh `bindkey -v`) break step 3 while they're in
+their own normal mode: backspace and pasted text become commands. Detect it from the cursor shape (DECSCUSR, block
+vs bar) if programs set it, else document "turn off the program's vi mode".
+
+### steps
+
+1. `prompt::keys(old, cursor, new, new_cursor, paste) -> bytes`: pure, tested alone
+2. `prompt::input(screen) -> Input`: string + cell map, tested on screens captured with drive from zsh, bash, fish,
+   python, claude code, codex. `I` / `A` use it, which fixes `I` on claude code's wrapped rows
+3. view n wiring: operators inside the input, changes out through step 1
+4. typing faster than the redraw (`xxxx`): base the next edit on the expected text until the screen catches up
+5. with shell integration (server step 6): exact input start from OSC 133 `B`, ghost text by its color
+
+Not worried about yet: undo across refreshes, trailing-space trimming in `vt::text`.
+
+## the server
 
 Detach, `vix ctl`, agents driving terminals, and running workflows headless all look like separate features. They
 aren't: they all fall out of making the list a long-lived object that more than one thing can talk to.
@@ -159,18 +210,9 @@ Each one ships on its own.
    detached, and `:w name` renames the session it saves.
 6. **shell integration**: OSC 133, `run`, `wait --prompt`, prompt jumps, running command in the list.
 
-## view n editing (open)
-
-The whole terminal output should be editable, not just navigable. Editing can't affect the process, so editing
-means a snapshot. Current lean: an edit operator (`d c x p`) freezes view n into a snapshot (`[snapshot]` in the
-bar). While frozen, `i a` edit text instead of going to the program; `:e!` returns to live. `:w file`, `:w !cmd`.
-Needs text objects (`iw iW i" ip`), `% { } * # .`, `<C-v>` first; those matter for yanking from output anyway.
-
-the main objective for this is editing a terminal prompt with vim motions and more
-
 ## vim scope
 
-All valid text **motions** should exist in every buffer (list, view n, snapshot). Operators, registers, and ex
+All valid text **motions** should exist in every buffer (list, view n, the prompt). Operators, registers, and ex
 commands grow from a small set. Homemade for now; `nvim --embed` behind the same interface if it gets uncanny.
 
 ## architecture
@@ -187,6 +229,7 @@ Rust. Pure modules first, I/O at the edges.
 | `remap` / `keyspec` | pure | non-recursive mappings, vim key notation |
 | `status` | pure | bar templates, overflow |
 | `picker` | pure | fuzzy finder over terminals |
+| `prompt` | pure | next: the input under the program's cursor; edits -> arrows, backspaces, paste |
 | `follow` / `carry` | pure | view n following output; `i a I A` moving a line editor's cursor |
 | `pty` / `proc` | io | spawn/resize/read/write, pid -> cwd |
 | `vt` / `dump` | io-ish | `vt100` per pty, query replies, text extraction; screen + scrollback as replayable bytes |

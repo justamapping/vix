@@ -22,6 +22,8 @@ pub struct Config {
     pub status: Status,
     /// vix takes the mouse for scrolling and selecting, unless the program in view asked for it
     pub mouse: bool,
+    pub incsearch: bool,
+    pub hlsearch: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -48,6 +50,8 @@ impl Default for Config {
             view: default_view(),
             status: Status::default(),
             mouse: true,
+            incsearch: true,
+            hlsearch: true,
         }
     }
 }
@@ -69,6 +73,8 @@ struct File {
     escape: Option<String>,
     timeoutlen: Option<u64>,
     mouse: Option<bool>,
+    incsearch: Option<bool>,
+    hlsearch: Option<bool>,
     map: Maps,
     status: StatusFile,
 }
@@ -107,6 +113,12 @@ pub fn parse(text: &str) -> Result<Config> {
     }
     if let Some(mouse) = file.mouse {
         config.mouse = mouse;
+    }
+    if let Some(incsearch) = file.incsearch {
+        config.incsearch = incsearch;
+    }
+    if let Some(hlsearch) = file.hlsearch {
+        config.hlsearch = hlsearch;
     }
     config.list = maps(&file.map.list)?;
     config.list_insert = maps(&file.map.list_insert)?;
