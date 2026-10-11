@@ -1,5 +1,6 @@
 //! Runs vix in a pty, sends each arg as keystrokes, prints the screen after each.
 //! `cargo build && cargo run --example drive -- 'jj\r' 'echo hi\r' '\x1c'`  (escapes: \r \e \xNN)
+//! `DRIVE_CMD` runs that command instead of vix; `DRIVE_SAVE` writes the final screen there as replayable bytes.
 
 use std::io::{Read, Write};
 use std::sync::{Arc, Mutex};
@@ -34,7 +35,15 @@ fn main() -> anyhow::Result<()> {
     let size = |k: &str, d: u16| env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
     let (rows, cols) = (size("DRIVE_ROWS", 12), size("DRIVE_COLS", 60));
     let pair = native_pty_system().openpty(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })?;
-    let mut cmd = CommandBuilder::new(concat!(env!("CARGO_MANIFEST_DIR"), "/target/debug/vix"));
+    let mut cmd = match env::var("DRIVE_CMD") {
+        Ok(line) => {
+            let mut words = line.split_whitespace();
+            let mut cmd = CommandBuilder::new(words.next().expect("empty DRIVE_CMD"));
+            cmd.args(words);
+            cmd
+        }
+        Err(_) => CommandBuilder::new(concat!(env!("CARGO_MANIFEST_DIR"), "/target/debug/vix")),
+    };
     cmd.args(env::var("DRIVE_ARGS").unwrap_or_default().split_whitespace());
     cmd.cwd(env::current_dir()?);
     cmd.env("SHELL", env::var("DRIVE_SHELL").unwrap_or("/bin/sh".into()));
@@ -73,6 +82,9 @@ fn main() -> anyhow::Result<()> {
             println!("--- vix exited: {status:?}");
             return Ok(());
         }
+    }
+    if let Ok(path) = env::var("DRIVE_SAVE") {
+        std::fs::write(path, parser.lock().unwrap().screen().state_formatted())?;
     }
     child.kill()?;
     Ok(())

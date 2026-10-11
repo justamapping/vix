@@ -56,7 +56,10 @@ a copy of the input and sends the difference to the program as keys. This replac
 
 ### what was verified (drive, zsh and claude code 2.1)
 
-- both keep the real cursor on their input; arrows move it. Left past the start clamps, so overshooting left is safe
+- both keep the real cursor on their input; arrows move it. Left past the start clamps in zsh, but overshooting is
+  not safe in general: claude code binds left on an empty prompt to its agent view (`← for agents` while a turn or
+  background task runs). Today's `i` on the `❯` column sends exactly that. Arrows must stop at the input's start,
+  so `I`/`i`/`a` go through `prompt::input` too, not raw screen distance
 - claude code wraps its input box itself (rows aren't vt-wrapped), which is why `I` on a second row lands on that
   row's start today. Its box is one string though: left arrows cross rows, and each break counts as one char (the
   space the wrap ate). A real newline (shift+enter) also counts as one, so arrow math holds either way
@@ -70,8 +73,8 @@ a copy of the input and sends the difference to the program as keys. This replac
    else stays read-only as today. `x dw ciw D p r ~`, visual, text objects as they land
 3. **send the difference**: common prefix/suffix of old and new, then arrows to the change's end, backspaces over
    it, the new text, arrows to the new cursor. Rules: never move right past the input's end (right accepts fish and
-   zsh autosuggestions), only backspace (forward delete isn't universal), insert as bracketed paste when the
-   program enabled it, else refuse newlines (a raw newline runs the command), count graphemes
+   zsh autosuggestions), only backspace (forward delete isn't universal), type text as keystrokes, bracketed paste
+   only for newlines and tabs (refused if the program hasn't enabled it), count chars like the buffer does
 4. **the program redraws**, view n refreshes, and a wrong guess corrects itself. The prompt string (`$ `) inside the
    "input" is harmless: shells refuse to move or delete into it. `c` and `s` delete, then enter view i
 
@@ -90,9 +93,12 @@ vs bar) if programs set it, else document "turn off the program's vi mode".
 
 ### steps
 
-1. `prompt::keys(old, cursor, new, new_cursor, paste) -> bytes`: pure, tested alone
-2. `prompt::input(screen) -> Input`: string + cell map, tested on screens captured with drive from zsh, bash, fish,
-   python, claude code, codex. `I` / `A` use it, which fixes `I` on claude code's wrapped rows
+1. ~~`prompt::keys`~~ (done): `(old, cursor, new, new_cursor, modes) -> bytes`, pure, tested alone
+2. ~~`prompt::input(screen) -> Input`~~ (done): string + cell map, tested on screens in `tests/screens` captured with
+   `DRIVE_CMD`/`DRIVE_SAVE` from zsh, bash, python 3.14, node, claude code (codex and fish not yet). The prompt ends
+   at a glyph + blank inside a styled prefix, else at that prefix's end (prompts without a glyph), else at the first
+   glyph + blank. Dim or bright-black text from the cursor on is ghost text. `i a I A` go through it and never pass
+   the input's ends; `I`/`A` are the input's start and end, across claude code's wrapped rows
 3. view n wiring: operators inside the input, changes out through step 1
 4. typing faster than the redraw (`xxxx`): base the next edit on the expected text until the screen catches up
 5. with shell integration (server step 6): exact input start from OSC 133 `B`, ghost text by its color

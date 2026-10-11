@@ -8,11 +8,11 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use crate::buffer::Line;
-use crate::motion::Pos;
+use crate::carry::Spot;
 use crate::session::{Saved, Session};
 
 /// Bump on any change to these types; client and server refuse to talk across versions.
-pub const VERSION: u32 = 4;
+pub const VERSION: u32 = 5;
 
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -20,8 +20,8 @@ pub enum Request {
     /// First message. `start` is what a new session spawns; an existing one ignores it.
     Hello { version: u32, cols: u16, rows: u16, start: Option<Start> },
     Input { id: u64, #[serde(with = "b64")] bytes: Vec<u8> },
-    /// moves a line editor's cursor to `at`, for `i a I A`
-    Carry { id: u64, at: Pos },
+    /// moves a line editor's cursor to `spot` on `row`, for `i a I A`
+    Carry { id: u64, row: usize, spot: Spot },
     Resize { cols: u16, rows: u16 },
     Focus { id: Option<u64> },
     /// `:w` of the list edited from `base`; `open` is a row to open once it's applied
@@ -180,7 +180,7 @@ mod tests {
             Request::Hello { version: VERSION, cols: 80, rows: 24, start: Some(start) },
             Request::Hello { version: VERSION, cols: 80, rows: 24, start: None },
             Request::Input { id: 1, bytes: b"echo hi\r\x1b[A\xff".to_vec() },
-            Request::Carry { id: 1, at: (2, 5) },
+            Request::Carry { id: 1, row: 2, spot: Spot::At(5) },
             Request::Resize { cols: 100, rows: 30 },
             Request::Focus { id: None },
             Request::Write { base: vec![0, 1], lines: vec![Line { id: Some(1), text: "web".into() }, Line { id: None, text: "api".into() }], open: Some(1) },

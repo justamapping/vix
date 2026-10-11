@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 
+use crate::carry::Spot;
 use crate::input::Key;
 use crate::keymap::{self, Action, Cmd, InsertAt, Motion, Operator, Parsed, Scroll, Target};
 use crate::motion::{self, Pos};
@@ -44,7 +45,7 @@ pub enum Effect {
     Yank(String),
     /// keys a read-only buffer passes up: `i a I A` with where they'd insert (`o O` without), `-`, `J`/`K`, `<C-^>`,
     /// and `1`-`9` as `Goto`
-    Insert(Option<Pos>),
+    Insert(Option<(usize, Spot)>),
     Parent,
     Switch(isize),
     Alternate,
@@ -401,7 +402,7 @@ impl Buffer {
                 }
             }
             Action::Operate(Operator::Yank, target) => return self.operate(Operator::Yank, target, count),
-            Action::Insert(at) if self.readonly => return vec![Effect::Insert(self.insert_at(at))],
+            Action::Insert(at) if self.readonly => return vec![Effect::Insert(self.spot(at))],
             Action::Operate(..) | Action::Insert(_) | Action::Paste { .. } if self.readonly => {
                 self.message = Some(READONLY.into());
             }
@@ -653,6 +654,17 @@ impl Buffer {
             InsertAt::LineEnd => Some((row, char_len(text))),
             InsertAt::Below | InsertAt::Above => None,
         }
+    }
+
+    /// Where `i a I A` put a program's cursor from view n: a char, or its input's start or end.
+    fn spot(&self, at: InsertAt) -> Option<(usize, Spot)> {
+        let (row, col) = self.insert_at(at)?;
+        let spot = match at {
+            InsertAt::LineStart => Spot::Start,
+            InsertAt::LineEnd => Spot::End,
+            _ => Spot::At(col),
+        };
+        Some((row, spot))
     }
 
     fn start_insert(&mut self, at: InsertAt) {
@@ -1022,8 +1034,8 @@ mod tests {
         assert_eq!(feed(&mut b, "dd"), vec![]);
         assert_eq!(b.lines.len(), 2);
         assert!(b.message.as_deref().unwrap().starts_with("E21"));
-        assert_eq!(feed(&mut b, "a"), vec![Effect::Insert(Some((0, 1)))]);
-        assert_eq!(feed(&mut b, "A"), vec![Effect::Insert(Some((0, 4)))]);
+        assert_eq!(feed(&mut b, "a"), vec![Effect::Insert(Some((0, Spot::At(1))))]);
+        assert_eq!(feed(&mut b, "A"), vec![Effect::Insert(Some((0, Spot::End)))]);
         assert_eq!(feed(&mut b, "o"), vec![Effect::Insert(None)]);
         assert_eq!(feed(&mut b, "-"), vec![Effect::Parent]);
         assert_eq!(feed(&mut b, "K"), vec![Effect::Switch(-1)]);

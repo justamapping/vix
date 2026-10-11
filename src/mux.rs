@@ -8,10 +8,9 @@ use anyhow::{Error, Result};
 
 use crate::app::pump;
 use crate::buffer::Line;
-use crate::carry;
+use crate::carry::{self, Spot};
 use crate::dump;
 use crate::listdiff::{self, Op};
-use crate::motion::Pos;
 use crate::proc;
 use crate::pty::Pty;
 use crate::session::Saved;
@@ -77,13 +76,13 @@ impl Term {
         Ok((self.activity, self.bell) != flags)
     }
 
-    /// Moves a line editor's cursor to `at` (a row counting scrollback, a char index) with arrow keys, for `i a I A`.
-    pub fn carry(&mut self, (row, index): Pos) -> Result<()> {
+    /// Moves a line editor's cursor to `spot` on `row` (counting scrollback) with arrow keys, for `i a I A`.
+    pub fn carry(&mut self, row: usize, spot: Spot) -> Result<()> {
         if !self.raw() {
             return Ok(());
         }
         let Some(row) = row.checked_sub(vt::history(self.vt.screen_mut())) else { return Ok(()) };
-        if let Some(keys) = carry::arrows(self.vt.screen(), row as u16, index) {
+        if let Some(keys) = carry::arrows(self.vt.screen(), row as u16, spot) {
             self.write(&keys)?;
         }
         Ok(())

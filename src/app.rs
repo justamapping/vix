@@ -8,6 +8,7 @@ use anyhow::Result;
 use ratatui::DefaultTerminal;
 
 use crate::buffer::{self, Buffer, Effect, Line};
+use crate::carry::Spot;
 use crate::client::{self, Remote, Term};
 use crate::config::Config;
 use crate::follow;
@@ -507,8 +508,8 @@ impl App {
         for effect in effects {
             match effect {
                 Effect::Insert(at) => {
-                    if let Some(at) = at {
-                        self.carry(id, at)?;
+                    if let Some((row, spot)) = at {
+                        self.carry(id, row, spot)?;
                     }
                     self.set_view(View::Insert(id));
                 }
@@ -557,8 +558,8 @@ impl App {
     }
 
     /// Moves a line editor's cursor to where `i a I A` asked, when that's on its line; anywhere else it stays put.
-    fn carry(&mut self, id: u64, at: Pos) -> Result<()> {
-        self.remote.send(&Request::Carry { id, at });
+    fn carry(&mut self, id: u64, row: usize, spot: Spot) -> Result<()> {
+        self.remote.send(&Request::Carry { id, row, spot });
         Ok(())
     }
 

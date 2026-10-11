@@ -212,9 +212,9 @@ impl Server {
                     t.write(&bytes)?;
                 }
             }
-            Request::Carry { id, at } => {
+            Request::Carry { id, row, spot } => {
                 if let Some(t) = self.mux.get_mut(id) {
-                    t.carry(at)?;
+                    t.carry(row, spot)?;
                 }
             }
             Request::Resize { cols, rows } => {
