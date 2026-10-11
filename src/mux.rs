@@ -286,6 +286,26 @@ impl<E: From<PtyEvent> + Send + 'static> Mux<E> {
         (placed, errors)
     }
 
+    /// Spawns each of `saved` that no terminal has the name of yet, and with `prune` kills terminals not in `saved`.
+    /// Running it twice does nothing the second time. Returns how many it spawned and killed.
+    pub fn apply(&mut self, saved: Vec<Saved>, prune: bool) -> Result<(usize, usize)> {
+        let current: Vec<(u64, &str)> = self.terms.iter().map(|t| (t.id, t.name.as_str())).collect();
+        let wanted: Vec<&str> = saved.iter().map(|s| s.name.as_str()).collect();
+        let (matched, extra) = listdiff::by_name(&current, &wanted);
+        let missing: Vec<Saved> = saved.into_iter().zip(matched).filter(|(_, m)| m.is_none()).map(|(s, _)| s).collect();
+        let spawned = missing.len();
+        if spawned > 0 {
+            self.open(missing)?;
+        }
+        let killed = if prune { extra.len() } else { 0 };
+        for id in extra.into_iter().take(killed) {
+            if let Some(mut t) = self.remove(id) {
+                t.kill();
+            }
+        }
+        Ok((spawned, killed))
+    }
+
     /// Names, live directories, and commands, without output.
     pub fn saved(&self) -> Vec<Saved> {
         self.terms.iter().map(|t| Saved { cmd: t.cmd.clone(), ..Saved::new(t.name.clone(), t.cwd()) }).collect()
@@ -334,6 +354,22 @@ mod tests {
         assert!(!mux.alive(a) && placed.iter().all(|id| id.is_some_and(|id| mux.alive(id))));
         assert_eq!(mux.rename(b, "b".into()).as_deref(), Some("bee"));
         assert_eq!(mux.saved()[2].cwd, PathBuf::from("/"));
+        mux.kill_all();
+    }
+
+    #[test]
+    fn apply_spawns_whats_missing_once() {
+        let (tx, _rx) = mpsc::channel();
+        let mut mux: Mux<PtyEvent> = Mux::new(tx, 80, 24, std::env::temp_dir(), None);
+        mux.spawn(Saved::new("web", "/")).unwrap();
+        mux.spawn(Saved::new("scratch", "/")).unwrap();
+        let wanted = || vec![Saved::new("web", "/"), Saved::new("api", "/gone")];
+        assert_eq!(mux.apply(wanted(), false).unwrap(), (1, 0));
+        assert_eq!(names(&mux), ["web", "scratch", "api"]);
+        assert_eq!(mux.terms()[2].cwd, std::env::temp_dir(), "a directory that's gone falls back");
+        assert_eq!(mux.apply(wanted(), false).unwrap(), (0, 0));
+        assert_eq!(mux.apply(wanted(), true).unwrap(), (0, 1));
+        assert_eq!(names(&mux), ["web", "api"]);
         mux.kill_all();
     }
 }

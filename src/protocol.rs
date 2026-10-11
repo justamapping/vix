@@ -13,7 +13,7 @@ use crate::prompt::Change;
 use crate::session::{Saved, Session};
 
 /// Bump on any change to these types; client and server refuse to talk across versions.
-pub const VERSION: u32 = 6;
+pub const VERSION: u32 = 7;
 
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -29,8 +29,8 @@ pub enum Request {
     Focus { id: Option<u64> },
     /// `:w` of the list edited from `base`; `open` is a row to open once it's applied
     Write { base: Vec<u64>, lines: Vec<Line>, open: Option<usize> },
-    /// `:e`, `:new`; the reply's `List` opens it
-    Spawn { name: String, from: Option<u64> },
+    /// `:e`, `:new`, `vix ctl new`; the reply's `List` opens it. In `cwd`, else `from`'s, typing `cmd`
+    Spawn { name: String, from: Option<u64>, cwd: Option<PathBuf>, cmd: Option<String> },
     Kill { id: u64 },
     Rename { id: u64, name: String },
     /// `cursor` is the asker's list row, saved with the workflow
@@ -39,7 +39,13 @@ pub enum Request {
     Refresh,
     /// `vix -l`, without attaching
     Info,
+    /// a terminal's screen as text, or its scrollback and screen
+    Read { id: u64, scrollback: bool },
+    /// `vix ctl apply`: spawns each terminal no unused one has the name of, and with `prune` kills the rest
+    Apply { terms: Vec<Seed>, prune: bool },
     Detach,
+    /// detaches every client, for `vix ctl detach`
+    DetachAll,
     /// `:qa`; `cursor` is the asker's list row, for `--resume`
     KillSession { cursor: usize },
 }
@@ -56,9 +62,12 @@ pub enum Reply {
     Resized { cols: u16, rows: u16 },
     Exited { id: u64 },
     Message { text: String },
+    /// a request failed
+    Error { text: String },
     /// `since` is when its last client left, or it started, in unix ms; `vix -a` picks the latest
     // defaulted, so `vix -l` still reads servers from before it
-    Info { name: String, terms: usize, clients: usize, #[serde(default)] since: u64 },
+    Info { name: String, terms: usize, clients: usize, #[serde(default)] since: u64, #[serde(default)] version: u32 },
+    Text { lines: Vec<String> },
     /// the server is done with this client: killed, version mismatch
     Bye { reason: String },
 }
@@ -187,13 +196,17 @@ mod tests {
             Request::Resize { cols: 100, rows: 30 },
             Request::Focus { id: None },
             Request::Write { base: vec![0, 1], lines: vec![Line { id: Some(1), text: "web".into() }, Line { id: None, text: "api".into() }], open: Some(1) },
-            Request::Spawn { name: "logs".into(), from: Some(1) },
+            Request::Spawn { name: "logs".into(), from: Some(1), cwd: None, cmd: None },
+            Request::Spawn { name: "dev".into(), from: None, cwd: Some("/srv".into()), cmd: Some("npm run dev".into()) },
             Request::Kill { id: 1 },
             Request::Rename { id: 1, name: "tail".into() },
             Request::Save { workflow: Some("demo".into()), cursor: 1 },
             Request::Refresh,
             Request::Info,
+            Request::Read { id: 1, scrollback: true },
+            Request::Apply { terms: vec![Seed { name: "web".into(), cwd: "/srv".into(), cmd: None, output: vec![] }], prune: true },
             Request::Detach,
+            Request::DetachAll,
             Request::KillSession { cursor: 0 },
         ]);
     }
@@ -209,7 +222,9 @@ mod tests {
             Reply::Resized { cols: 80, rows: 24 },
             Reply::Exited { id: 3 },
             Reply::Message { text: "\"web\" 3 terminals written".into() },
-            Reply::Info { name: "0".into(), terms: 2, clients: 1, since: 1_700_000_000_000 },
+            Reply::Error { text: "no terminal %3".into() },
+            Reply::Info { name: "0".into(), terms: 2, clients: 1, since: 1_700_000_000_000, version: VERSION },
+            Reply::Text { lines: vec!["$ ls".into(), "".into()] },
             Reply::Bye { reason: "killed".into() },
         ]);
     }

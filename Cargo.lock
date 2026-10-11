@@ -1722,6 +1722,7 @@ dependencies = [
  "nucleo-matcher",
  "portable-pty",
  "ratatui",
+ "regex",
  "serde",
  "serde_json",
  "signal-hook",

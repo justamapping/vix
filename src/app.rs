@@ -357,7 +357,7 @@ impl App {
                 }
                 true
             }
-            Reply::Message { text } => {
+            Reply::Message { text } | Reply::Error { text } => {
                 let buf = if matches!(self.view, View::Normal(_)) { &mut self.normal } else { &mut self.list };
                 buf.message = Some(text);
                 true
@@ -384,7 +384,7 @@ impl App {
                 }
                 true
             }
-            Reply::Info { .. } => false,
+            Reply::Info { .. } | Reply::Text { .. } => false,
         }
     }
 
@@ -778,7 +778,7 @@ impl App {
             self.set_view(View::Insert(id));
             return;
         }
-        self.remote.send(&Request::Spawn { name, from });
+        self.remote.send(&Request::Spawn { name, from, cwd: None, cmd: None });
     }
 
     fn open(&mut self, id: Option<u64>) {

@@ -3,6 +3,7 @@ mod buffer;
 mod carry;
 mod client;
 mod config;
+mod ctl;
 mod dump;
 mod follow;
 mod input;
@@ -49,12 +50,16 @@ const BATCH: usize = 256;
 
 const USAGE: &str = "usage: vix [-r | --resume] [workflow]
        vix -a | --attach [session]
-       vix -l | --list";
+       vix -l | --list
+       vix ctl <verb>, see vix ctl --help";
 
 fn main() -> Result<()> {
     let (mut resume, mut attach, mut list) = (false, false, false);
     let mut name: Option<String> = None;
-    let mut args = std::env::args().skip(1);
+    let mut args = std::env::args().skip(1).peekable();
+    if args.next_if(|a| a == "ctl").is_some() {
+        return ctl::run(args.collect());
+    }
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "-r" | "--resume" => resume = true,

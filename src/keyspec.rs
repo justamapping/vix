@@ -71,6 +71,26 @@ pub fn ctrl_byte(key: Key) -> Option<u8> {
     }
 }
 
+/// What a terminal sends for `keys`, arrows in normal cursor mode.
+pub fn bytes(keys: &[Key]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for &key in keys {
+        match key {
+            Key::Char(c) => out.extend(c.to_string().as_bytes()),
+            Key::Ctrl(_) => out.extend(ctrl_byte(key)),
+            Key::Enter => out.push(b'\r'),
+            Key::Esc => out.push(0x1b),
+            Key::Backspace => out.push(0x7f),
+            Key::Tab => out.push(b'\t'),
+            Key::Up => out.extend(b"\x1b[A"),
+            Key::Down => out.extend(b"\x1b[B"),
+            Key::Right => out.extend(b"\x1b[C"),
+            Key::Left => out.extend(b"\x1b[D"),
+        }
+    }
+    out
+}
+
 /// Parses the escape key, which must be a single ctrl key so it's one byte on the wire.
 pub fn escape(s: &str) -> Result<u8> {
     match parse(s)?.as_slice() {
@@ -103,6 +123,13 @@ mod tests {
     #[test]
     fn aliases_match_input() {
         assert_eq!(parse("<C-i><C-m><C-[><C-h>").unwrap(), vec![Tab, Enter, Esc, Backspace]);
+    }
+
+    #[test]
+    fn keys_to_bytes() {
+        assert_eq!(bytes(&parse("npm test<CR>").unwrap()), b"npm test\r");
+        assert_eq!(bytes(&parse("<C-c><Up><BS><Esc>é").unwrap()), "\x03\x1b[A\x7f\x1bé".as_bytes());
+        assert_eq!(bytes(&parse("<C-\\>").unwrap()), b"\x1c");
     }
 
     #[test]

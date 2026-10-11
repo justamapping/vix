@@ -47,6 +47,15 @@ any      --:qa-->    quit vix    (:q only quits from the list)
 - **resume**: `vix -r` restores names, live cwd (pid -> cwd like tmux), and scrollback (`dump`), not programs.
 - **workflows**: `:w name` saves the list to `~/.config/vix/workflows/name.toml`, after which `:w` keeps saving
   there. `vix name` opens one (or a new one, like `vim newfile`). Per terminal: `name`, `cwd` (`~` ok), `cmd`.
+- **prompt editing**: operators in view n edit the program's input (shells, REPLs, claude code), see below.
+- **`vix ctl`**: ls, new, kill, rename, send, read, wait, apply, save, sessions, detach, kill-session. See "ctl".
+
+## priorities
+
+1. ~~**`vix ctl`**~~ (server step 4, done)
+2. **text objects**, `r`, `~` in the vim; view n's prompt editing gets them for free
+3. **fast edits** (prompt editing step 4): `xxxx` faster than the redraw must not edit the wrong spot
+4. **shell integration**, only if its payoff is worth how opinionated it is (see "shell integration")
 
 ## next: prompt editing
 
@@ -104,8 +113,15 @@ vs bar) if programs set it, else document "turn off the program's vi mode".
    yanked output pastes in. The client sends a `prompt::Change` (old text and cursor, new text and cursor); the
    server types it only if its own screen still shows that input and the cursor isn't a block (the program's own vi
    normal mode), else says why. `c` and `s` end in view i. `r`, `~`, text objects and `.` wait on the vim itself
-4. typing faster than the redraw (`xxxx`): base the next edit on the expected text until the screen catches up
-5. with shell integration (server step 6): exact input start from OSC 133 `B`, ghost text by its color
+4. typing faster than the redraw (`xxxx`): each edit is computed from the last screen. If the server's screen moved
+   on, the edit is refused (lost keystroke); if neither has but the program took the last edit, the keys assume the
+   wrong cursor (wrong edit). Remember the text and cursor an edit should produce and base the next edit on it until
+   the screen shows it or a short timeout passes. Most likely in claude code, which redraws slower than zsh; test a
+   burst there first
+5. text objects, `r`, `~`: in the vim itself, nothing prompt-specific
+
+OSC 133 would only give shells an exact input start (`B`); REPLs and claude code don't emit it and nothing marks the
+input's end, so the heuristics stay either way. Not a step here; it comes with shell integration if that happens.
 
 Not worried about yet: undo across refreshes, trailing-space trimming in `vt::text`.
 
@@ -176,12 +192,17 @@ Pty size follows the most recently active client (tmux's `window-size latest`).
 Newline-delimited JSON over the unix socket, bytes as base64. Debuggable with `socat`, easy for agents. The flood
 measurement in 3g found no need for binary frames. The messages are in server.md's protocol section.
 
-`ctl` adds connections that send requests and get replies without attaching: they aren't clients, get no output,
-and don't take the pty size. Settling that handshake (`Hello { kind: ui|ctl }` or similar) is step 4's first part.
+`ctl` connections send requests and get replies without attaching: they never say `Hello`, so they get no
+output and don't take the pty size. No new handshake: `Info` carries the protocol version, which ctl checks first,
+and ctl sends another `Info` after each request as a barrier, so it knows the request was handled and sees its
+`Error`s (split from `Message` so ctl can exit nonzero).
 
 ### ctl
 
-`vix ctl <verb>`, a thin client. A target `<t>` is a name, an index (`3`), `%id`, or `.` (self; the default inside vix).
+`vix ctl <verb>`, a thin client (`src/ctl.rs`). A target `<t>` is a name, an index (`3`), `%id`, or `.` (the
+terminal ctl runs in). Targets are required positionals, so `.` is explicit rather than a default. A name two
+terminals share is an error, not the first match. The session is `-s`, else the one ctl runs in, else the only one
+running; several is an error rather than a guess.
 
 ```
 vix ctl ls [--json]                      index, id, name, state, cwd, cmd
@@ -190,12 +211,18 @@ vix ctl kill <t> | rename <t> <name>
 vix ctl send <t> 'npm test<CR>'          vim key notation (keyspec); --raw for literal bytes
 vix ctl read <t> [--all | --lines n]     the text view n would show
 vix ctl wait <t> --match pat | --idle 2s | --exit | --prompt   [--timeout]
-vix ctl run <t> 'npm test'               send + wait for the prompt, print that command's output, exit with its status
+vix ctl run <t> 'npm test'               (needs shell integration) send + wait for the prompt, output, exit status
 vix ctl apply <workflow|file> [--prune] | save <workflow>
 vix ctl sessions | detach | kill-session
 ```
 
-`ctl` also becomes the test harness: scripts that `send` and `read` replace `examples/drive.rs`.
+Built as written, except `run` and `wait --prompt`, which wait on shell integration. `wait` polls `read` every
+100ms: `--match` is a regex over the screen (multi-line, so `^$` work per row), `--idle` is the screen unchanged
+that long, `--exit` is the id gone from the list (a `%id` already gone counts, ids aren't reused). `new` defaults
+to ctl's own directory and prints the `%id`. `apply` matches by name, appends what's missing, `--prune` kills the
+rest; it doesn't reorder.
+
+`ctl` could also become the test harness: scripts that `send` and `read` replace `examples/drive.rs`. Not done.
 
 ### shell integration
 
@@ -206,6 +233,11 @@ ghostty, kitty, and vscode do (`ZDOTDIR`, `--rcfile`). Without it, fall back to 
 The same marks give humans `[[` `]]` between prompts in view n, "yank last output", and the running command and
 exit code for the list and the bar (old milestone 5).
 
+Deferred until something needs it. Injecting it means vix changes how the user's shell starts (a vix-owned
+`ZDOTDIR` whose `.zshrc` sources the real one, then adds hooks), so it needs an off switch; the less opinionated
+option is a line users `source` themselves. `ctl wait --idle` and the prompt heuristics already cover most of it.
+Revisit if `ctl run` (exact output, exit status) turns out to matter, then weigh payoff against opinionation.
+
 ### steps
 
 Each one ships on its own.
@@ -215,10 +247,11 @@ Each one ships on its own.
 2. ~~**3-way diff**~~ (done) in `listdiff`, and `Buffer::rebase` for the staged list on list changes.
 3. ~~**server/client**~~ (done): `vix --server`, attach via dump + stream, detach on hangup and `:qd`, `-a`, `-l`.
    Detailed in server.md.
-4. **ctl**: ls, new, kill, rename, send, read, wait, apply, save.
+4. ~~**ctl**~~ (done): ls, new, kill, rename, send, read, wait, apply, save, sessions, detach, kill-session.
 5. **sessions are workflows**: `vix web` attaching or starting shipped in step 3. Left: `vix -d web` starts
    detached, and `:w name` renames the session it saves.
-6. **shell integration**: OSC 133, `run`, `wait --prompt`, prompt jumps, running command in the list.
+6. **shell integration** (deferred, see above): OSC 133, `run`, `wait --prompt`, prompt jumps, running command in
+   the list.
 
 ## vim scope
 
@@ -249,7 +282,7 @@ Rust. Pure modules first, I/O at the edges.
 | `protocol` | pure | the messages between client and server |
 | `server` / `outbox` | io | `vix --server`: owns the `Mux`, serves clients, one bounded writer per client |
 | `client` / `sock` | io | the remote list and vt replicas; socket paths, starting servers, `-l` |
-| `ctl` | io | next: thin client for scripts and agents |
+| `ctl` | io | `vix ctl`: thin client for scripts and agents |
 
 vix is a multiplexer, not an emulator: it runs inside ghostty/kitty/etc. like tmux, and keeps a vt parser per pty
 only to know what's on screen.

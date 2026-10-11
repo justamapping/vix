@@ -34,6 +34,17 @@ pub fn diff(base: &[u64], current: &[(u64, &str)], new: &[Line]) -> Vec<Op> {
     ops
 }
 
+/// Matches `wanted` names to `current` terminals by name, each to the first one not matched yet, for applying a
+/// workflow to a running list. Returns each wanted name's match, and the terminals nothing matched.
+pub fn by_name(current: &[(u64, &str)], wanted: &[&str]) -> (Vec<Option<u64>>, Vec<u64>) {
+    let mut free: Vec<(u64, &str)> = current.to_vec();
+    let matched = wanted
+        .iter()
+        .map(|w| free.iter().position(|(_, n)| n == w).map(|i| free.remove(i).0))
+        .collect();
+    (matched, free.into_iter().map(|(id, _)| id).collect())
+}
+
 /// Human summary of what `ops` would do to `old` (id, name) terminals, e.g. "spawn web, kill api". Empty if nothing.
 pub fn summary(old: &[(u64, &str)], ops: &[Op]) -> String {
     let name = |id: u64| old.iter().find(|(i, _)| *i == id).map_or("?", |(_, n)| n);
@@ -76,6 +87,13 @@ mod tests {
     fn d(old: &[u64], new: &[Line]) -> Vec<Op> {
         let current: Vec<(u64, &str)> = old.iter().map(|&id| (id, "?")).collect();
         diff(old, &current, new)
+    }
+
+    #[test]
+    fn by_name_takes_the_first_unused_match() {
+        let current = [(1, "web"), (2, "api"), (3, "web"), (4, "logs")];
+        assert_eq!(by_name(&current, &["web", "web", "web", "api"]), (vec![Some(1), Some(3), None, Some(2)], vec![4]));
+        assert_eq!(by_name(&[], &["web"]), (vec![None], vec![]));
     }
 
     #[test]

@@ -17,6 +17,7 @@ use crate::outbox::Outbox;
 use crate::protocol::{self, Entry, List, Reply, Request, Screen, Start};
 use crate::session::{self, Saved, Session};
 use crate::sock;
+use crate::vt;
 use crate::workflow;
 
 // how long full-screen programs stay a row short on attach, so they see two sizes and redraw
@@ -147,7 +148,7 @@ impl Server {
             Event::Drained(cid) => self.resend(cid)?,
             Event::Request(cid, request) => {
                 if let Err(e) = self.request(cid, request) {
-                    self.send(cid, &Reply::Message { text: format!("{e:#}") });
+                    self.send(cid, &Reply::Error { text: format!("{e:#}") });
                 }
             }
         }
@@ -222,7 +223,7 @@ impl Server {
                     && !t.change(&change)?
                 {
                     let text = "can't edit: input changed or program in vi mode".into();
-                    self.send(cid, &Reply::Message { text });
+                    self.send(cid, &Reply::Error { text });
                 }
             }
             Request::Resize { cols, rows } => {
@@ -236,12 +237,12 @@ impl Server {
                 let (ids, errors) = self.mux.write(&base, &lines);
                 self.lists(Some(cid), open.and_then(|row| ids.get(row).copied().flatten()));
                 if let Some(e) = errors.first() {
-                    self.send(cid, &Reply::Message { text: format!("spawn failed: {e}") });
+                    self.send(cid, &Reply::Error { text: format!("spawn failed: {e}") });
                 }
             }
-            Request::Spawn { name, from } => {
-                let cwd = from.and_then(|id| self.mux.get(id)).map_or(self.mux.cwd.clone(), Term::cwd);
-                let id = self.mux.spawn(Saved::new(name, cwd)).context("spawn failed")?;
+            Request::Spawn { name, from, cwd, cmd } => {
+                let cwd = cwd.unwrap_or_else(|| from.and_then(|id| self.mux.get(id)).map_or(self.mux.cwd.clone(), Term::cwd));
+                let id = self.mux.spawn(Saved { cmd, ..Saved::new(name, cwd) }).context("spawn failed")?;
                 self.lists(Some(cid), Some(id));
             }
             Request::Kill { id } => {
@@ -270,9 +271,28 @@ impl Server {
             Request::Info => {
                 let clients = self.clients.values().filter(|c| c.attached).count();
                 let since = self.left.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64);
-                self.send(cid, &Reply::Info { name: self.name.clone(), terms: self.mux.len(), clients, since });
+                let (name, terms, version) = (self.name.clone(), self.mux.len(), protocol::VERSION);
+                self.send(cid, &Reply::Info { name, terms, clients, since, version });
+            }
+            Request::Read { id, scrollback } => {
+                let t = self.mux.get_mut(id).with_context(|| format!("no terminal %{id}"))?;
+                let screen = t.vt.screen_mut();
+                let lines = if scrollback { vt::text(screen) } else { screen.rows(0, screen.size().1).collect() };
+                self.send(cid, &Reply::Text { lines });
+            }
+            Request::Apply { terms, prune } => {
+                let terms = Start { terms, ..Start::default() }.session().terms;
+                let (spawned, killed) = self.mux.apply(terms, prune)?;
+                self.lists(None, None);
+                self.send(cid, &Reply::Message { text: format!("{spawned} spawned, {killed} killed") });
             }
             Request::Detach => self.bye(cid, "detached"),
+            Request::DetachAll => {
+                let attached: Vec<usize> = self.clients.iter().filter(|(_, c)| c.attached).map(|(cid, _)| *cid).collect();
+                for cid in attached {
+                    self.bye(cid, "detached");
+                }
+            }
             Request::KillSession { cursor } => self.kill_session(cursor),
         }
         Ok(())
@@ -453,6 +473,7 @@ impl Server {
 mod tests {
     use super::*;
     use crate::buffer::Line;
+    use crate::protocol::Seed;
     use crate::vt;
     use std::thread::JoinHandle;
 
@@ -581,7 +602,7 @@ mod tests {
         assert!(shows(&mut copy, &hi));
 
         // only the client that spawned is told to open it
-        b.send(Request::Spawn { name: "logs".into(), from: Some(sh) });
+        b.send(Request::Spawn { name: "logs".into(), from: Some(sh), cwd: None, cmd: None });
         let list = b.list();
         assert_eq!(names(&list), ["sh", "logs"]);
         let logs = list.open.expect("opens what it spawned");
@@ -612,6 +633,44 @@ mod tests {
         server.join().unwrap().unwrap();
         assert!(!path.exists());
         assert!(fs::read_to_string(last).unwrap().contains("name = \"www\""));
+    }
+
+    #[test]
+    fn ctl_reads_applies_and_detaches_everyone() {
+        let tmp = tempfile::Builder::new().prefix("vx").tempdir_in("/tmp").unwrap();
+        let (path, _, server) = start(tmp.path());
+        let (mut ui, _) = TestClient::hello(&path, one("sh"));
+        let mut ctl = TestClient::connect(&path);
+        let message = |c: &mut TestClient| c.until(|r| if let Reply::Message { text } | Reply::Error { text } = r { Some(text) } else { None });
+
+        ctl.send(Request::Spawn { name: "dev".into(), from: None, cwd: Some("/tmp".into()), cmd: Some("echo ctl-$((6*7))".into()) });
+        let dev = ctl.list().open.expect("opens what it spawned");
+        let deadline = std::time::Instant::now() + TIMEOUT;
+        loop {
+            ctl.send(Request::Read { id: dev, scrollback: false });
+            let lines = ctl.until(|r| if let Reply::Text { lines } = r { Some(lines) } else { None });
+            if lines.iter().any(|l| l.trim() == "ctl-42") {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "never ran its cmd: {lines:?}");
+            thread::sleep(Duration::from_millis(50));
+        }
+        ctl.send(Request::Read { id: 99, scrollback: false });
+        assert_eq!(message(&mut ctl), "no terminal %99");
+
+        let seeds = |names: &[&str]| names.iter().map(|&n| Seed { name: n.into(), cwd: "/".into(), cmd: None, output: vec![] }).collect();
+        ctl.send(Request::Apply { terms: seeds(&["dev", "api"]), prune: false });
+        assert_eq!(message(&mut ctl), "1 spawned, 0 killed");
+        ctl.send(Request::Apply { terms: seeds(&["dev", "api"]), prune: false });
+        assert_eq!(message(&mut ctl), "0 spawned, 0 killed");
+        ctl.send(Request::Apply { terms: seeds(&["api"]), prune: true });
+        assert_eq!(message(&mut ctl), "0 spawned, 2 killed");
+        assert_eq!(names(&ui.until(|r| if let Reply::List(l) = r { (l.terms.len() == 1).then_some(l) } else { None })), ["api"]);
+
+        ctl.send(Request::DetachAll);
+        assert_eq!(ui.until(|r| if let Reply::Bye { reason } = r { Some(reason) } else { None }), "detached");
+        ctl.send(Request::KillSession { cursor: 0 });
+        server.join().unwrap().unwrap();
     }
 
     #[test]

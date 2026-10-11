@@ -24,7 +24,8 @@ pub fn save(name: &str, session: Session) -> Result<()> {
     save_to(&path(name)?, session)
 }
 
-fn load_from(path: &Path) -> Result<Option<Session>> {
+/// A workflow file anywhere, `None` if it doesn't exist.
+pub fn load_from(path: &Path) -> Result<Option<Session>> {
     let text = match std::fs::read_to_string(path) {
         Ok(text) => text,
         Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),

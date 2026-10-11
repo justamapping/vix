@@ -141,7 +141,7 @@ pub fn info(stream: UnixStream) -> Result<Live> {
     stream.set_read_timeout(Some(INFO_TIMEOUT))?;
     protocol::send(&mut &stream, &Request::Info)?;
     match protocol::recv(&mut BufReader::new(&stream))? {
-        Some(Reply::Info { name, terms, clients, since }) => Ok(Live { name, terms, clients, since }),
+        Some(Reply::Info { name, terms, clients, since, .. }) => Ok(Live { name, terms, clients, since }),
         Some(Reply::Bye { reason }) => bail!(reason),
         _ => bail!("no answer"),
     }
@@ -280,7 +280,7 @@ mod tests {
             let (stream, _) = listener.accept().unwrap();
             let request: Option<Request> = protocol::recv(&mut BufReader::new(&stream)).unwrap();
             assert_eq!(request, Some(Request::Info));
-            protocol::send(&mut &stream, &Reply::Info { name: "0".into(), terms: 3, clients: 1, since: 5 }).unwrap();
+            protocol::send(&mut &stream, &Reply::Info { name: "0".into(), terms: 3, clients: 1, since: 5, version: protocol::VERSION }).unwrap();
         });
         let live = info(connect(&path).unwrap().unwrap()).unwrap();
         assert_eq!(live, Live { name: "0".into(), terms: 3, clients: 1, since: 5 });
