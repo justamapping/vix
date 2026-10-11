@@ -4,6 +4,7 @@ use crate::carry::Spot;
 use crate::input::Key;
 use crate::keymap::{self, Action, Cmd, InsertAt, Motion, Operator, Parsed, Scroll, Target};
 use crate::motion::{self, Pos};
+use crate::prompt::{Change, Field};
 use crate::remap::{self, Map};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -56,6 +57,8 @@ pub enum Effect {
     Delete(Option<String>),
     /// view n's `:r name` renames the terminal in view
     Rename(String),
+    /// an operator in view n changed the program's input; `insert` if it ends in insert mode, like `c`
+    Change { change: Change, insert: bool },
     /// `:e name` views the terminal called `name`, spawning it if there is none; `:new name` always spawns
     Edit { name: String, new: bool },
     /// the list's `:w name` writes, then saves the list as that workflow
@@ -82,6 +85,8 @@ pub struct Buffer {
     pub cmdline: String,
     pub message: Option<String>,
     pub readonly: bool,
+    /// the program's input, which view n's operators edit
+    pub input: Option<Field>,
     /// first visible row and how many rows are visible
     pub top: usize,
     pub height: usize,
@@ -136,6 +141,7 @@ impl Buffer {
             cmdline: String::new(),
             message: None,
             readonly: false,
+            input: None,
             top: 0,
             height: 1,
             maps: Vec::new(),
@@ -403,8 +409,8 @@ impl Buffer {
             }
             Action::Operate(Operator::Yank, target) => return self.operate(Operator::Yank, target, count),
             Action::Insert(at) if self.readonly => return vec![Effect::Insert(self.spot(at))],
-            Action::Operate(..) | Action::Insert(_) | Action::Paste { .. } if self.readonly => {
-                self.message = Some(READONLY.into());
+            Action::Operate(..) | Action::Paste { .. } if self.readonly => {
+                return self.change_input(None, |b| _ = b.run(Cmd { count, action }));
             }
             Action::Operate(op, target) => return self.operate(op, target, count),
             Action::Insert(at) => self.start_insert(at),
@@ -581,8 +587,10 @@ impl Buffer {
         let Some((start, end, _)) = self.selection() else { return vec![] };
         self.mode = Mode::Normal;
         if self.readonly && op != Operator::Yank {
-            self.message = Some(READONLY.into());
-            return vec![];
+            return self.change_input(Some(self.anchor), |b| {
+                b.mode = Mode::Visual { line: linewise };
+                b.operate_selection(op, linewise);
+            });
         }
         if linewise {
             self.operate_lines(op, start.0, end.0);
@@ -591,6 +599,31 @@ impl Buffer {
             self.operate_span(op, start, (end.0, (end.1 + 1).min(end_len)));
         }
         self.yanked(op)
+    }
+
+    /// Runs `edit` on a one-line copy of the program's input when the cursor, and `anchor` if any, are on it; anywhere
+    /// else view n is read-only.
+    fn change_input(&mut self, anchor: Option<Pos>, edit: impl FnOnce(&mut Buffer)) -> Vec<Effect> {
+        let index = |p: Pos| self.input.as_ref().and_then(|f| f.index(p));
+        let (Some(field), Some(cursor), Some(anchor)) = (self.input.clone(), index(self.cursor), index(anchor.unwrap_or(self.cursor))) else {
+            self.message = Some(READONLY.into());
+            return vec![];
+        };
+        let mut b = Buffer::new(vec![Line { id: None, text: field.text.clone() }]);
+        (b.cursor, b.anchor, b.register) = ((0, cursor), (0, anchor), self.register.take());
+        edit(&mut b);
+        b.clamp();
+        self.register = b.register.take();
+        let (new, new_cursor) = b.flat();
+        let change = Change { old: field.text, cursor: field.cursor, new, new_cursor };
+        vec![Effect::Change { change, insert: b.mode == Mode::Insert }]
+    }
+
+    /// The lines as one string, and the cursor as a char index into it.
+    fn flat(&self) -> (String, usize) {
+        let (row, col) = self.cursor;
+        let before: usize = self.lines[..row].iter().map(|l| char_len(&l.text) + 1).sum();
+        (self.texts().join("\n"), before + col)
     }
 
     fn operate_lines(&mut self, op: Operator, r0: usize, r1: usize) {
@@ -881,6 +914,7 @@ fn split(cmd: &str) -> (&str, &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::prompt::{Change, Field};
 
     fn buf(names: &[&str]) -> Buffer {
         Buffer::new(names.iter().enumerate().map(|(i, n)| Line { id: Some(i as u64), text: n.to_string() }).collect())
@@ -1049,6 +1083,65 @@ mod tests {
         assert_eq!(feed(&mut b, "yy"), vec![Effect::Yank("$ ls\n".into())]);
         assert_eq!(feed(&mut b, ":x\r"), vec![Effect::Quit { force: false }]);
         assert_eq!(feed(&mut b, ":xd\r"), vec![Effect::Detach { force: false }]);
+    }
+
+    /// View n over a row of output and a `$ ` prompt with `input` typed, the program's cursor at its end.
+    fn prompt_view(input: &str) -> Buffer {
+        let mut b = view(&["a b", &format!("$ {input}")]);
+        let n = char_len(input);
+        b.input = Some(Field { text: input.into(), cursor: n, at: (2..=n + 2).map(|c| (1, c)).collect() });
+        b.cursor = (1, 2);
+        b
+    }
+
+    fn change(old: &str, new: &str, new_cursor: usize, insert: bool) -> Vec<Effect> {
+        let change = Change { old: old.into(), cursor: char_len(old), new: new.into(), new_cursor };
+        vec![Effect::Change { change, insert }]
+    }
+
+    #[test]
+    fn operators_edit_the_input() {
+        let s = "echo hello world";
+        let mut b = prompt_view(s);
+        assert_eq!(feed(&mut b, "dw"), change(s, "hello world", 0, false));
+        assert_eq!(feed(&mut b, "x"), change(s, "cho hello world", 0, false));
+        assert_eq!(feed(&mut b, "wcw"), change(s, "echo  world", 5, true));
+        assert_eq!(feed(&mut b, "D"), change(s, "echo ", 4, false));
+        assert_eq!(feed(&mut b, "$x"), change(s, "echo hello worl", 14, false));
+        assert_eq!(feed(&mut b, "dd"), change(s, "", 0, false));
+        assert_eq!(feed(&mut b, "S"), change(s, "", 0, true));
+        assert_eq!(feed(&mut b, "0wvlld"), change(s, "o hello world", 0, false));
+        assert_eq!(b.cursor, (1, 4));
+    }
+
+    #[test]
+    fn output_stays_read_only() {
+        let mut b = prompt_view("ls");
+        assert_eq!(feed(&mut b, "kx"), vec![]);
+        assert!(b.message.as_deref().unwrap().starts_with("E21"));
+        assert_eq!(feed(&mut b, "jvkd"), vec![]);
+        assert_eq!(feed(&mut b, "0x"), vec![]);
+        assert_eq!(b.lines[1].text, "$ ls");
+    }
+
+    #[test]
+    fn yank_output_and_paste_it_into_the_input() {
+        let mut b = prompt_view("echo hello world");
+        feed(&mut b, "k0yw");
+        assert_eq!(feed(&mut b, "j$p"), change("echo hello world", "echo hello worlda ", 17, false));
+        feed(&mut b, "kyy");
+        assert_eq!(feed(&mut b, "jp"), change("echo hello world", "echo hello world\na b", 17, false));
+        let mut b = prompt_view("");
+        feed(&mut b, "k0yw");
+        assert_eq!(feed(&mut b, "jP"), change("", "a ", 1, false));
+    }
+
+    #[test]
+    fn deleted_input_is_in_the_register() {
+        let mut b = prompt_view("ls");
+        feed(&mut b, "x");
+        assert_eq!(feed(&mut b, "p"), change("ls", "lls", 1, false));
+        assert_eq!(feed(&mut b, "k$p"), vec![]);
     }
 
     #[test]

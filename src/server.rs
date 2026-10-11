@@ -217,6 +217,14 @@ impl Server {
                     t.carry(row, spot)?;
                 }
             }
+            Request::Change { id, change } => {
+                if let Some(t) = self.mux.get_mut(id)
+                    && !t.change(&change)?
+                {
+                    let text = "can't edit: input changed or program in vi mode".into();
+                    self.send(cid, &Reply::Message { text });
+                }
+            }
             Request::Resize { cols, rows } => {
                 if let Some(c) = self.clients.get_mut(&cid) {
                     c.size = (cols, rows);

@@ -16,6 +16,7 @@ use crate::input::{self, Input, Key, Mouse, MouseKind};
 use crate::listdiff;
 use crate::motion::Pos;
 use crate::picker::{Item, Pick, Picker};
+use crate::prompt;
 use crate::protocol::{List, Reply, Request, Start};
 use crate::render::{self, Bar};
 use crate::sock;
@@ -208,6 +209,7 @@ impl App {
         let screen = t.vt.screen_mut();
         let live = follow::live(screen);
         let lines = vt::text(screen).into_iter().map(|text| Line { id: None, text }).collect();
+        self.normal.input = prompt::field(screen);
         self.normal.load(lines);
         self.normal.message = None;
         self.normal.place(live.cursor, live.bottom);
@@ -222,7 +224,9 @@ impl App {
         }
         self.stale = false;
         let Some(t) = self.term(id) else { return };
-        let lines = vt::text(t.vt.screen_mut()).into_iter().map(|text| Line { id: None, text }).collect();
+        let screen = t.vt.screen_mut();
+        let lines = vt::text(screen).into_iter().map(|text| Line { id: None, text }).collect();
+        self.normal.input = prompt::field(screen);
         self.normal.refresh(lines);
     }
 
@@ -551,6 +555,12 @@ impl App {
                 Effect::Pick => self.pick(),
                 Effect::Delete(name) => self.delete(id, name),
                 Effect::Rename(name) => self.rename(id, name),
+                Effect::Change { change, insert } => {
+                    self.remote.send(&Request::Change { id, change });
+                    if insert {
+                        self.set_view(View::Insert(id));
+                    }
+                }
                 Effect::Open(_) | Effect::Write | Effect::Save(_) => {}
             }
         }

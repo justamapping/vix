@@ -15,7 +15,6 @@ mod mux;
 mod outbox;
 mod picker;
 mod proc;
-#[allow(dead_code)] // wired in prompt editing step 3
 mod prompt;
 mod protocol;
 mod pty;

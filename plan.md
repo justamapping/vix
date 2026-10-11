@@ -99,7 +99,11 @@ vs bar) if programs set it, else document "turn off the program's vi mode".
    at a glyph + blank inside a styled prefix, else at that prefix's end (prompts without a glyph), else at the first
    glyph + blank. Dim or bright-black text from the cursor on is ghost text. `i a I A` go through it and never pass
    the input's ends; `I`/`A` are the input's start and end, across claude code's wrapped rows
-3. view n wiring: operators inside the input, changes out through step 1
+3. ~~view n wiring~~ (done): view n's buffer holds the input as a `prompt::Field` (view n coordinates). Operators
+   and `p`/`P` whose cursor (and visual anchor) are on it run on a one-line copy of it, sharing view n's register, so
+   yanked output pastes in. The client sends a `prompt::Change` (old text and cursor, new text and cursor); the
+   server types it only if its own screen still shows that input and the cursor isn't a block (the program's own vi
+   normal mode), else says why. `c` and `s` end in view i. `r`, `~`, text objects and `.` wait on the vim itself
 4. typing faster than the redraw (`xxxx`): base the next edit on the expected text until the screen catches up
 5. with shell integration (server step 6): exact input start from OSC 133 `B`, ghost text by its color
 

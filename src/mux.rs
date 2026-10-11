@@ -12,6 +12,7 @@ use crate::carry::{self, Spot};
 use crate::dump;
 use crate::listdiff::{self, Op};
 use crate::proc;
+use crate::prompt::Change;
 use crate::pty::Pty;
 use crate::session::Saved;
 use crate::vt;
@@ -86,6 +87,13 @@ impl Term {
             self.write(&keys)?;
         }
         Ok(())
+    }
+
+    /// Types `change` into a line editor, if its screen still shows the input the change was made from. Returns
+    /// whether it did.
+    pub fn change(&mut self, change: &Change) -> Result<bool> {
+        let keys = self.raw().then(|| change.keys(self.vt.screen(), vt::modes(&self.vt))).flatten();
+        keys.map(|keys| self.write(&keys)).transpose().map(|done| done.is_some())
     }
 
     /// Clears activity and bell, now that it's been seen.

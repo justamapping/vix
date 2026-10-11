@@ -9,10 +9,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::buffer::Line;
 use crate::carry::Spot;
+use crate::prompt::Change;
 use crate::session::{Saved, Session};
 
 /// Bump on any change to these types; client and server refuse to talk across versions.
-pub const VERSION: u32 = 5;
+pub const VERSION: u32 = 6;
 
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -22,6 +23,8 @@ pub enum Request {
     Input { id: u64, #[serde(with = "b64")] bytes: Vec<u8> },
     /// moves a line editor's cursor to `spot` on `row`, for `i a I A`
     Carry { id: u64, row: usize, spot: Spot },
+    /// retypes a line editor's input, for operators in view n
+    Change { id: u64, change: Change },
     Resize { cols: u16, rows: u16 },
     Focus { id: Option<u64> },
     /// `:w` of the list edited from `base`; `open` is a row to open once it's applied

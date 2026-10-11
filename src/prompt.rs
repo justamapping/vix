@@ -1,7 +1,9 @@
+use serde::{Deserialize, Serialize};
 use vt100::{Cell, Color, Screen};
 
 use crate::carry::arrow;
-use crate::vt::Modes;
+use crate::motion::Pos;
+use crate::vt::{self, Modes};
 
 /// Last char of a prompt, when a blank follows it.
 const GLYPHS: [&str; 9] = ["$", "%", "#", ">", "❯", "›", "»", "➜", "λ"];
@@ -25,6 +27,49 @@ impl Input {
     pub fn index(&self, row: u16, col: u16) -> Option<usize> {
         let on_row = |&(r, _): &(u16, u16)| r == row;
         self.cells.iter().rposition(|&c| on_row(&c) && c.1 <= col).or_else(|| self.cells.iter().position(on_row))
+    }
+}
+
+/// An input as view n sees it, for editing there.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Field {
+    pub text: String,
+    pub cursor: usize,
+    /// The view n position of each char (row counting scrollback, char index into it), then of the end.
+    pub at: Vec<Pos>,
+}
+
+impl Field {
+    /// Char index of view n position `pos`; anywhere on an empty input's row is its start.
+    pub fn index(&self, pos: Pos) -> Option<usize> {
+        let empty = self.text.is_empty() && pos.0 == self.at[0].0;
+        self.at.iter().position(|&p| p == pos).or(empty.then_some(0))
+    }
+}
+
+/// `input` in view n's coordinates.
+pub fn field(screen: &mut Screen) -> Option<Field> {
+    let history = vt::history(screen);
+    let Input { text, cells, cursor } = input(screen)?;
+    let at = cells.into_iter().map(|(r, c)| (history + r as usize, vt::index(screen, r, c))).collect();
+    Some(Field { text, cursor, at })
+}
+
+/// An edit made in view n: the input `old`, with the program's cursor at `cursor`, becomes `new` with it at
+/// `new_cursor`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Change {
+    pub old: String,
+    pub cursor: usize,
+    pub new: String,
+    pub new_cursor: usize,
+}
+
+impl Change {
+    /// The keys that make it, if `screen` still shows the input it was made from.
+    pub fn keys(&self, screen: &Screen, modes: Modes) -> Option<Vec<u8>> {
+        input(screen).filter(|i| i.text == self.old && i.cursor == self.cursor)?;
+        keys(&self.old, self.cursor, &self.new, self.new_cursor, modes)
     }
 }
 
@@ -145,6 +190,10 @@ pub fn keys(old: &str, cursor: usize, new: &str, new_cursor: usize, modes: Modes
     if old == new {
         return Some(moves(cursor, new_cursor, modes.app_cursor));
     }
+    // a block cursor is the program's own vi normal mode, where backspace and text are commands
+    if matches!(modes.cursor_shape, 1 | 2) {
+        return None;
+    }
     let pre = old.iter().zip(&new).take_while(|(a, b)| a == b).count();
     let room = old.len().min(new.len()) - pre;
     let suf = old.iter().rev().zip(new.iter().rev()).take(room).take_while(|(a, b)| a == b).count();
@@ -240,6 +289,36 @@ pub(crate) mod tests {
     fn autosuggestions_are_not_input() {
         assert_eq!(input_of("$ ec\x1b[90mho hi\x1b[m\x1b[5D"), at("ec", 2));
         assert_eq!(input_of("$ ec\x1b[2mho hi\x1b[m\x1b[5D"), at("ec", 2));
+    }
+
+    #[test]
+    fn field_is_in_view_n_coordinates() {
+        let mut p = vt::parser(20, 3);
+        p.process("out\r\nput\r\nmore\r\n$ 日本x".as_bytes());
+        let f = field(p.screen_mut()).unwrap();
+        assert_eq!((f.text.as_str(), f.cursor), ("日本x", 3));
+        assert_eq!(f.at, vec![(3, 2), (3, 3), (3, 4), (3, 5)]);
+        assert_eq!((f.index((3, 3)), f.index((3, 0)), f.index((2, 2))), (Some(1), None, None));
+        let mut p = vt::parser(20, 3);
+        p.process(b"$ ");
+        assert_eq!(field(p.screen_mut()).unwrap().index((0, 0)), Some(0));
+    }
+
+    #[test]
+    fn changes_only_apply_to_the_input_they_were_made_from() {
+        let mut p = vt::parser(20, 3);
+        p.process(b"$ echo hi");
+        let change = |old: &str, cursor| Change { old: old.into(), cursor, new: "echo".into(), new_cursor: 4 };
+        assert_eq!(change("echo hi", 7).keys(p.screen(), PLAIN), Some(bs(3).into_bytes()));
+        assert_eq!(change("echo ho", 7).keys(p.screen(), PLAIN), None);
+        assert_eq!(change("echo hi", 6).keys(p.screen(), PLAIN), None);
+    }
+
+    #[test]
+    fn a_block_cursor_only_moves() {
+        let block = Modes { cursor_shape: 2, ..PLAIN };
+        assert_eq!(keys("ab", 2, "ab", 0, block), Some(l(2).into_bytes()));
+        assert_eq!(keys("ab", 2, "a", 1, block), None);
     }
 
     const PLAIN: Modes = Modes {
