@@ -85,6 +85,9 @@ pub struct Entry {
     pub name: String,
     pub cwd: PathBuf,
     pub cmd: Option<String>,
+    /// what's running in the foreground, None when the shell is at its prompt
+    #[serde(default)]
+    pub fg: Option<String>,
     pub activity: bool,
     pub bell: bool,
 }
@@ -168,7 +171,7 @@ mod tests {
     use std::io::BufReader;
 
     fn list() -> List {
-        let entry = Entry { id: 3, name: "web".into(), cwd: "/srv".into(), cmd: Some("npm run dev".into()), activity: true, bell: false };
+        let entry = Entry { id: 3, name: "web".into(), cwd: "/srv".into(), cmd: Some("npm run dev".into()), fg: Some("node".into()), activity: true, bell: false };
         List { terms: vec![entry], workflow: Some("demo".into()), open: Some(3) }
     }
 

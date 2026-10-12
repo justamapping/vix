@@ -15,13 +15,14 @@ use crate::sock;
 use crate::workflow;
 
 pub const USAGE: &str = "usage: vix ctl [-s session] <verb>
-  ls [--json]                          index, %id, name, cwd, cmd, flags
+  ls [--json]                          index, %id, name, cwd, cmd, what's running, flags
   new [name] [-c dir] [-- cmd]         prints its %id
   kill <t>
   rename <t> <name>
   send <t> [--raw] <keys>...           vim key notation: 'npm test<CR>', '<C-c>'
   read <t> [--all | --lines n]         the screen as text; --all adds scrollback
-  wait <t> --match re | --idle 2s | --exit   [--timeout 30s]
+  wait <t> --done | --match re | --idle 2s | --exit   [--timeout 30s]
+                                       --done: the shell is back at its prompt
   apply <workflow|file.toml> [--prune] spawns what's missing by name
   save [workflow]
   sessions | detach | kill-session
@@ -30,6 +31,8 @@ the session is -s, else the one ctl runs in, else the only one running.";
 
 // how often `wait` looks
 const POLL: Duration = Duration::from_millis(100);
+// how long the shell must be in the foreground with a still screen for `wait --done`, so a command that was just sent has time to start
+const SETTLE: Duration = Duration::from_millis(300);
 
 #[derive(Debug, PartialEq)]
 pub enum Cmd {
@@ -56,6 +59,7 @@ pub enum Lines {
 
 #[derive(Debug, PartialEq)]
 pub enum Until {
+    Done,
     Match(String),
     Idle(Duration),
     Exit,
@@ -151,11 +155,12 @@ pub fn parse(args: Vec<String>) -> Result<(Option<String>, Cmd)> {
         }
         "wait" => {
             let timeout = a.value("--timeout").map(|t| duration(&t)).transpose()?;
-            let until = match (a.value("--match"), a.value("--idle"), a.flag("--exit")) {
-                (Some(re), None, false) => Until::Match(re),
-                (None, Some(d), false) => Until::Idle(duration(&d)?),
-                (None, None, true) => Until::Exit,
-                _ => bail!("wait for one of --match, --idle, --exit"),
+            let until = match (a.flag("--done"), a.value("--match"), a.value("--idle"), a.flag("--exit")) {
+                (true, None, None, false) => Until::Done,
+                (false, Some(re), None, false) => Until::Match(re),
+                (false, None, Some(d), false) => Until::Idle(duration(&d)?),
+                (false, None, None, true) => Until::Exit,
+                _ => bail!("wait for one of --done, --match, --idle, --exit"),
             };
             Cmd::Wait { target: a.done(1, 1)?.remove(0), until, timeout }
         }
@@ -243,6 +248,9 @@ pub fn table(terms: &[Entry]) -> Vec<String> {
             let mut row = format!("{}  %{:<3} {:<width$}  {}", i + 1, t.id, t.name, workflow::tilde(&t.cwd));
             if let Some(cmd) = &t.cmd {
                 row += &format!("  $ {cmd}");
+            }
+            if let Some(fg) = &t.fg {
+                row += &format!("  [running {fg}]");
             }
             if t.activity {
                 row += "  [activity]";
@@ -399,17 +407,24 @@ fn wait(conn: &mut Conn, id: u64, until: Until, timeout: Option<Duration>) -> Re
         _ => None,
     };
     let mut last: (Vec<String>, Instant) = (Vec::new(), start);
+    // how long the screen has looked the same
+    let mut still = |conn: &mut Conn| -> Result<Duration> {
+        let text = conn.read(id, false)?;
+        if text != last.0 {
+            last = (text, Instant::now());
+        }
+        Ok(last.1.elapsed())
+    };
     loop {
         let done = match &until {
+            Until::Done => {
+                let quiet = still(conn)?;
+                let term = conn.list()?.into_iter().find(|t| t.id == id).context("the terminal exited")?;
+                term.fg.is_none() && quiet >= SETTLE
+            }
             Until::Exit => !conn.list()?.iter().any(|t| t.id == id),
             Until::Match(_) => matches(re.as_ref().expect("built above"), &conn.read(id, false)?),
-            Until::Idle(idle) => {
-                let text = conn.read(id, false)?;
-                if text != last.0 {
-                    last = (text, Instant::now());
-                }
-                last.1.elapsed() >= *idle
-            }
+            Until::Idle(idle) => still(conn)? >= *idle,
         };
         if done {
             return Ok(());
@@ -435,7 +450,7 @@ mod tests {
     }
 
     fn entry(id: u64, name: &str) -> Entry {
-        Entry { id, name: name.into(), cwd: "/".into(), cmd: None, activity: false, bell: false }
+        Entry { id, name: name.into(), cwd: "/".into(), cmd: None, fg: None, activity: false, bell: false }
     }
 
     #[test]
@@ -454,13 +469,14 @@ mod tests {
             parse(args("wait %3 --idle 500ms --timeout 1m")).unwrap().1,
             Cmd::Wait { target: "%3".into(), until: Until::Idle(Duration::from_millis(500)), timeout: Some(Duration::from_secs(60)) }
         );
+        assert_eq!(parse(args("wait . --done")).unwrap().1, Cmd::Wait { target: ".".into(), until: Until::Done, timeout: None });
         assert_eq!(parse(args("apply web --prune")).unwrap().1, Cmd::Apply { workflow: "web".into(), prune: true });
         assert_eq!(parse(args("save")).unwrap().1, Cmd::Save(None));
     }
 
     #[test]
     fn rejects_bad_args() {
-        for bad in ["", "frob", "kill", "kill a b", "ls --bogus", "ls extra", "read a --all --lines 2", "wait a", "wait a --exit --idle 1s", "send a", "-s"] {
+        for bad in ["", "frob", "kill", "kill a b", "ls --bogus", "ls extra", "read a --all --lines 2", "wait a", "wait a --exit --idle 1s", "wait a --done --exit", "send a", "-s"] {
             assert!(parse(args(bad)).is_err(), "{bad}");
         }
     }

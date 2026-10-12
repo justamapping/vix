@@ -212,19 +212,21 @@ terminals share is an error, not the first match. The session is `-s`, else the 
 running; several is an error rather than a guess.
 
 ```
-vix ctl ls [--json]                      index, id, name, state, cwd, cmd
+vix ctl ls [--json]                      index, id, name, state, cwd, cmd, foreground program
 vix ctl new [name] [-c dir] [-- cmd]     prints the id
 vix ctl kill <t> | rename <t> <name>
 vix ctl send <t> 'npm test<CR>'          vim key notation (keyspec); --raw for literal bytes
 vix ctl read <t> [--all | --lines n]     the text view n would show
-vix ctl wait <t> --match pat | --idle 2s | --exit | --prompt   [--timeout]
+vix ctl wait <t> --done | --match pat | --idle 2s | --exit   [--timeout]
 vix ctl run <t> 'npm test'               (needs shell integration) send + wait for the prompt, output, exit status
 vix ctl apply <workflow|file> [--prune] | save <workflow>
 vix ctl sessions | detach | kill-session
 ```
 
-Built as written, except `run` and `wait --prompt`, which wait on shell integration. `wait` polls `read` every
-100ms: `--match` is a regex over the screen (multi-line, so `^$` work per row), `--idle` is the screen unchanged
+Built as written, except `run`, which waits on shell integration. `wait` polls `read` every
+100ms: `--done` is the shell back in the foreground (the pty's foreground process group is the shell, like tmux's
+`pane_current_command`) with the screen still for 300ms, so a command just sent has time to start; it never fires
+while a full-screen program or REPL is in front. `--match` is a regex over the screen (multi-line, so `^$` work per row), `--idle` is the screen unchanged
 that long, `--exit` is the id gone from the list (a `%id` already gone counts, ids aren't reused). `new` defaults
 to ctl's own directory and prints the `%id`. `apply` matches by name, appends what's missing, `--prune` kills the
 rest; it doesn't reorder.
@@ -313,6 +315,13 @@ only to know what's on screen.
 - `/` from the list: names only, or scrollback across all terminals into the picker?
 - restrict names so the rest of the line is free for annotations (`web  # dev server`)?
 
+### answers
+- read --full shows full output, read --diff shows diffed. we can decide the default
+
+- showing whether an agent spawned a terminal is probably a good idea, but we need a good solution for this opposed to one that's more of a bandaid. terminals spawned via ctl is an easier tell
+
+- a canonical search like jetbrains does to find function definitions couldn't hurt (i think it's shift+shift), to search across all terminals and jump somewhere. would be super powerful
+
 ## concepts
 agents or people can get a suite of commands that let you drive and read vix
 vix read {workspace} {name} # read contents of a terminal
@@ -322,3 +331,8 @@ vix mv # concept to move a workspace to another computer
 vix remote # concept to orchestrate remote terminals instead of driving it inside them, now you can orchestrate multiple remote sessions from one central computer
 vix workflows # list workflows to update or delete 
 vix kill {detached id}
+
+a terminating character a user can't go past that shows things like a directory, i.e.
+myterminal \trm ~/programs/.dotfiles
+
+jetbrains idea-esque shift+shift search inside to search across all terminal output and show options to jump to

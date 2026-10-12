@@ -413,7 +413,7 @@ impl Server {
             .mux
             .terms()
             .iter()
-            .map(|t| Entry { id: t.id, name: t.name.clone(), cwd: t.cwd(), cmd: t.cmd.clone(), activity: t.activity, bell: t.bell })
+            .map(|t| Entry { id: t.id, name: t.name.clone(), cwd: t.cwd(), cmd: t.cmd.clone(), fg: t.fg(), activity: t.activity, bell: t.bell })
             .collect();
         List { terms, workflow: self.workflow.clone(), open }
     }

@@ -50,6 +50,11 @@ impl Pty {
         unsafe { libc::tcgetattr(fd, &mut t) == 0 && t.c_lflag & libc::ICANON == 0 }
     }
 
+    /// The leader of the foreground process group, the shell itself when it's at its prompt.
+    pub fn foreground(&self) -> Option<u32> {
+        self.master.process_group_leader().map(|pid| pid as u32)
+    }
+
     pub fn pid(&self) -> Option<u32> {
         self.child.process_id()
     }

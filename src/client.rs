@@ -169,7 +169,7 @@ mod tests {
     use std::sync::mpsc;
 
     fn entry(id: u64, name: &str) -> Entry {
-        Entry { id, name: name.into(), cwd: "/tmp".into(), cmd: None, activity: false, bell: false }
+        Entry { id, name: name.into(), cwd: "/tmp".into(), cmd: None, fg: None, activity: false, bell: false }
     }
 
     fn list(entries: Vec<Entry>) -> List {

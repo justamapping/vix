@@ -50,6 +50,15 @@ impl Term {
         self.pty.pid().and_then(proc::cwd).unwrap_or_else(|| self.cwd.clone())
     }
 
+    /// The program running in the foreground, or None when the shell is.
+    pub fn fg(&self) -> Option<String> {
+        let leader = self.pty.foreground()?;
+        if Some(leader) == self.pty.pid() {
+            return None;
+        }
+        proc::name(leader)
+    }
+
     pub fn write(&mut self, bytes: &[u8]) -> Result<()> {
         self.typed = None;
         self.pty.write(bytes)
