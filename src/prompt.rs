@@ -277,7 +277,7 @@ pub(crate) mod tests {
     use super::*;
     use crate::vt;
 
-    /// A screen captured with `DRIVE_CMD=... DRIVE_SAVE=tests/screens/name.vt` (zsh is the author's config).
+    /// A screen captured with `DRIVE_CMD=... DRIVE_SAVE=tests/screens/name.vt scripts/drive ...` (zsh is the author's config).
     pub fn fixture(name: &str, rows: u16, cols: u16) -> vt::Parser {
         let mut p = vt::parser(cols, rows);
         p.process(&std::fs::read(format!("{}/tests/screens/{name}.vt", env!("CARGO_MANIFEST_DIR"))).unwrap());

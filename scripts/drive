@@ -1,0 +1,54 @@
+#!/bin/sh
+# Runs vix in a scratch session, sends each arg as keys, prints the screen after each. Built on `vix ctl`.
+#   cargo build && scripts/drive 'jj' 'echo hi<CR>' '<C-\>'     keys in vim notation, like `vix ctl send`
+# DRIVE_CMD runs that instead of vix, DRIVE_ARGS are added to it, DRIVE_SAVE writes the final screen there as
+# replayable bytes (tests/screens). DRIVE_ROWS and DRIVE_COLS size it (12x60), DRIVE_SHELL is the shell vix runs.
+set -eu
+
+vix=$(cd "$(dirname "$0")/.." && pwd)/target/debug/vix
+cmd="${DRIVE_CMD:-$vix} ${DRIVE_ARGS:-}"
+session=drive-$$
+# sessions the driven vix starts, so they die with this one
+runtime=$(mktemp -d)
+
+# a non-login sh with a fixed prompt, whatever the machine's profile says
+shell=${DRIVE_SHELL:-$runtime/shell}
+if [ -z "${DRIVE_SHELL:-}" ]; then
+	printf '#!/bin/sh\nunset ENV\nexport PS1="$ "\nexec /bin/sh -i\n' >"$shell"
+	chmod +x "$shell"
+fi
+
+ctl() { "$vix" ctl -s "$session" "$@"; }
+
+cleanup() {
+	for sock in "$runtime"/vix/*.sock; do
+		[ -e "$sock" ] && XDG_RUNTIME_DIR=$runtime "$vix" ctl -s "$(basename "$sock" .sock)" kill-session
+	done
+	ctl kill-session 2>/dev/null || true
+	rm -rf "$runtime"
+}
+trap cleanup EXIT
+
+show() {
+	# a timeout just means it's still drawing, like a spinner
+	ctl wait 1 --idle 300ms --timeout 3s 2>/dev/null || true
+	printf -- '--- %s\n' "$1"
+	ctl read 1 --cursor
+}
+
+"$vix" -d -x "${DRIVE_COLS:-60}" -y "${DRIVE_ROWS:-12}" "$session" >/dev/null
+ctl wait 1 --idle 300ms --timeout 3s >/dev/null 2>&1 || true
+ctl send 1 --raw "clear; SHELL=$shell PS1='\$ ' XDG_RUNTIME_DIR=$runtime $cmd
+"
+show start
+for keys in "$@"; do
+	ctl send 1 "$keys"
+	show "$keys"
+	if ! ctl ls | grep -q '\[running '; then
+		echo "--- exited"
+		exit
+	fi
+done
+if [ -n "${DRIVE_SAVE:-}" ]; then
+	ctl read 1 --vt >"$DRIVE_SAVE"
+fi

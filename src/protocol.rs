@@ -13,7 +13,7 @@ use crate::prompt::Change;
 use crate::session::{Saved, Session};
 
 /// Bump on any change to these types; client and server refuse to talk across versions.
-pub const VERSION: u32 = 7;
+pub const VERSION: u32 = 8;
 
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -41,6 +41,8 @@ pub enum Request {
     Info,
     /// a terminal's screen as text, or its scrollback and screen
     Read { id: u64, scrollback: bool },
+    /// a terminal's screen as bytes a fresh parser of the same size replays, for `vix ctl read --vt`
+    Exact { id: u64 },
     /// `vix ctl apply`: spawns each terminal no unused one has the name of, and with `prune` kills the rest
     Apply { terms: Vec<Seed>, prune: bool },
     Detach,
@@ -67,7 +69,9 @@ pub enum Reply {
     /// `since` is when its last client left, or it started, in unix ms; `vix -a` picks the latest
     // defaulted, so `vix -l` still reads servers from before it
     Info { name: String, terms: usize, clients: usize, #[serde(default)] since: u64, #[serde(default)] version: u32 },
-    Text { lines: Vec<String> },
+    /// `cursor` is (row, col) on the screen
+    Text { lines: Vec<String>, cursor: (u16, u16) },
+    Screen(Screen),
     /// the server is done with this client: killed, version mismatch
     Bye { reason: String },
 }
@@ -207,6 +211,7 @@ mod tests {
             Request::Refresh,
             Request::Info,
             Request::Read { id: 1, scrollback: true },
+            Request::Exact { id: 1 },
             Request::Apply { terms: vec![Seed { name: "web".into(), cwd: "/srv".into(), cmd: None, output: vec![] }], prune: true },
             Request::Detach,
             Request::DetachAll,
@@ -227,7 +232,8 @@ mod tests {
             Reply::Message { text: "\"web\" 3 terminals written".into() },
             Reply::Error { text: "no terminal %3".into() },
             Reply::Info { name: "0".into(), terms: 2, clients: 1, since: 1_700_000_000_000, version: VERSION },
-            Reply::Text { lines: vec!["$ ls".into(), "".into()] },
+            Reply::Text { lines: vec!["$ ls".into(), "".into()], cursor: (1, 0) },
+            Reply::Screen(Screen { id: 3, bytes: b"\x1b[H$ ".to_vec() }),
             Reply::Bye { reason: "killed".into() },
         ]);
     }

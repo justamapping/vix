@@ -216,7 +216,7 @@ vix ctl ls [--json]                      index, id, name, state, cwd, cmd, foreg
 vix ctl new [name] [-c dir] [-- cmd]     prints the id
 vix ctl kill <t> | rename <t> <name>
 vix ctl send <t> 'npm test<CR>'          vim key notation (keyspec); --raw for literal bytes
-vix ctl read <t> [--all | --lines n]     the text view n would show
+vix ctl read <t> [--all | --lines n]     the text view n would show; --cursor, or --vt for replayable bytes
 vix ctl wait <t> --done | --match pat | --idle 2s | --exit   [--timeout]
 vix ctl run <t> 'npm test'               (needs shell integration) send + wait for the prompt, output, exit status
 vix ctl apply <workflow|file> [--prune] | save <workflow>
@@ -231,7 +231,9 @@ that long, `--exit` is the id gone from the list (a `%id` already gone counts, i
 to ctl's own directory and prints the `%id`. `apply` matches by name, appends what's missing, `--prune` kills the
 rest; it doesn't reorder.
 
-`ctl` could also become the test harness: scripts that `send` and `read` replace `examples/drive.rs`. Not done.
+`scripts/drive` is the dev harness on top of it (it replaced `examples/drive.rs`): a scratch session from `vix -d -x -y`,
+vix typed into it, then `send`, `wait --idle`, `read --cursor` per step, and `read --vt` for `tests/screens`. The
+vix it drives keeps its sessions in a temp `XDG_RUNTIME_DIR`, killed on exit, so none outlive it.
 
 ### shell integration
 
@@ -257,8 +259,8 @@ Each one ships on its own.
 3. ~~**server/client**~~ (done): `vix --server`, attach via dump + stream, detach on hangup and `:qd`, `-a`, `-l`.
    Detailed in server.md.
 4. ~~**ctl**~~ (done): ls, new, kill, rename, send, read, wait, apply, save, sessions, detach, kill-session.
-5. **sessions are workflows**: `vix web` attaching or starting shipped in step 3. Left: `vix -d web` starts
-   detached, and `:w name` renames the session it saves.
+5. **sessions are workflows**: `vix web` attaching or starting shipped in step 3, `vix -d web` starts it detached
+   (`-x`/`-y` size it). Left: `:w name` renames the session it saves.
 6. **shell integration** (deferred, see above): OSC 133, `run`, `wait --prompt`, prompt jumps, running command in
    the list.
 

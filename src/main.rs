@@ -30,7 +30,7 @@ mod textobj;
 mod vt;
 mod workflow;
 
-use std::io::{self, Write};
+use std::io::{self, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
@@ -43,20 +43,22 @@ use signal_hook::consts::{SIGHUP, SIGTERM, SIGWINCH};
 use signal_hook::iterator::Signals;
 
 use app::{App, Event};
-use protocol::Start;
+use protocol::{Reply, Request, Start};
 use session::Session;
 
 // events handled before a redraw, so a flooding program can't starve the screen
 const BATCH: usize = 256;
 
 const USAGE: &str = "usage: vix [-r | --resume] [workflow]
+       vix -d | --detached [-x cols] [-y rows] [-r | workflow]   starts it without attaching, prints its name
        vix -a | --attach [session]
        vix -l | --list
        vix ctl <verb>, see vix ctl --help";
 
 fn main() -> Result<()> {
-    let (mut resume, mut attach, mut list) = (false, false, false);
+    let (mut resume, mut attach, mut list, mut detached) = (false, false, false, false);
     let mut name: Option<String> = None;
+    let (mut cols, mut rows): (Option<u16>, Option<u16>) = (None, None);
     let mut args = std::env::args().skip(1).peekable();
     if args.next_if(|a| a == "ctl").is_some() {
         return ctl::run(args.collect());
@@ -66,6 +68,9 @@ fn main() -> Result<()> {
             "-r" | "--resume" => resume = true,
             "-a" | "--attach" => attach = true,
             "-l" | "--list" => list = true,
+            "-d" | "--detached" => detached = true,
+            "-x" => cols = Some(args.next().and_then(|n| n.parse().ok()).context("-x takes a number of columns")?),
+            "-y" => rows = Some(args.next().and_then(|n| n.parse().ok()).context("-y takes a number of rows")?),
             // started by a client, not by hand
             "--server" => return server::run(&args.next().context("--server needs a session name")?),
             "-h" | "--help" => {
@@ -77,13 +82,22 @@ fn main() -> Result<()> {
         }
     }
     if list {
-        if resume || attach || name.is_some() {
+        if resume || attach || detached || name.is_some() {
             bail!("--list takes nothing else\n{USAGE}");
         }
         return list_sessions();
     }
     if resume && (attach || name.is_some()) {
         bail!("--resume starts a new session, so it takes no name\n{USAGE}");
+    }
+    if detached {
+        if attach {
+            bail!("--detached starts a session, --attach joins one\n{USAGE}");
+        }
+        return start_detached(name, resume, (cols.unwrap_or(80), rows.unwrap_or(24)));
+    }
+    if cols.is_some() || rows.is_some() {
+        bail!("-x and -y size a --detached session; attached ones take the terminal's size\n{USAGE}");
     }
     let (session, stream, start, new_workflow) = connect(name, resume, attach)?;
     let (config, config_error) = config::load();
@@ -166,6 +180,26 @@ fn connect(workflow: Option<String>, resume: bool, attach: bool) -> Result<(Stri
     };
     let stream = sock::start(&path, &name)?;
     Ok((name, stream, Some(Start::new(session, workflow)), new))
+}
+
+/// `vix -d`: starts the session `connect` would attach to, sized `cols` x `rows`, and leaves without attaching.
+/// One that's running already is left as it is.
+fn start_detached(workflow: Option<String>, resume: bool, (cols, rows): (u16, u16)) -> Result<()> {
+    let (name, mut stream, start, _) = connect(workflow, resume, false)?;
+    if start.is_some() {
+        protocol::send(&mut stream, &Request::Hello { version: protocol::VERSION, cols, rows, start })?;
+        protocol::send(&mut stream, &Request::Detach)?;
+        let mut reader = BufReader::new(stream);
+        while let Some(reply) = protocol::recv(&mut reader)? {
+            match reply {
+                Reply::Bye { reason } if reason == "detached" => break,
+                Reply::Bye { reason } => bail!(reason),
+                _ => {}
+            }
+        }
+    }
+    println!("{name}");
+    Ok(())
 }
 
 fn run(app: &mut App, terminal: &mut DefaultTerminal, rx: Receiver<Event>) -> Result<()> {

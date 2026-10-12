@@ -1,6 +1,6 @@
 //! `vix ctl`: drives a running session from scripts and agents, one request at a time, without attaching.
 
-use std::io::BufReader;
+use std::io::{BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::thread;
@@ -20,7 +20,8 @@ pub const USAGE: &str = "usage: vix ctl [-s session] <verb>
   kill <t>
   rename <t> <name>
   send <t> [--raw] <keys>...           vim key notation: 'npm test<CR>', '<C-c>'
-  read <t> [--all | --lines n]         the screen as text; --all adds scrollback
+  read <t> [--all | --lines n] [--cursor]   the screen as text; --all adds scrollback
+  read <t> --vt                        the screen as bytes a parser of the same size replays
   wait <t> --done | --match re | --idle 2s | --exit   [--timeout 30s]
                                        --done: the shell is back at its prompt
   apply <workflow|file.toml> [--prune] spawns what's missing by name
@@ -41,7 +42,8 @@ pub enum Cmd {
     Kill(String),
     Rename(String, String),
     Send { target: String, keys: String, raw: bool },
-    Read { target: String, lines: Lines },
+    Read { target: String, lines: Lines, cursor: bool },
+    Vt(String),
     Wait { target: String, until: Until, timeout: Option<Duration> },
     Apply { workflow: String, prune: bool },
     Save(Option<String>),
@@ -144,14 +146,16 @@ pub fn parse(args: Vec<String>) -> Result<(Option<String>, Cmd)> {
             let target = pos.remove(0);
             Cmd::Send { target, keys: pos.concat(), raw }
         }
+        "read" if a.flag("--vt") => Cmd::Vt(a.done(1, 1)?.remove(0)),
         "read" => {
+            let cursor = a.flag("--cursor");
             let lines = match (a.flag("--all"), a.value("--lines")) {
                 (false, None) => Lines::Screen,
                 (true, None) => Lines::All,
                 (false, Some(n)) => Lines::Last(n.parse().context("--lines takes a number")?),
                 (true, Some(_)) => bail!("--all or --lines, not both"),
             };
-            Cmd::Read { target: a.done(1, 1)?.remove(0), lines }
+            Cmd::Read { target: a.done(1, 1)?.remove(0), lines, cursor }
         }
         "wait" => {
             let timeout = a.value("--timeout").map(|t| duration(&t)).transpose()?;
@@ -306,9 +310,10 @@ impl Conn {
         }
     }
 
-    fn read(&mut self, id: u64, scrollback: bool) -> Result<Vec<String>> {
+    /// The lines, and the cursor as (row, col) on the screen.
+    fn read(&mut self, id: u64, scrollback: bool) -> Result<(Vec<String>, (u16, u16))> {
         match self.ask(&Request::Read { id, scrollback })?.into_iter().next() {
-            Some(Reply::Text { lines }) => Ok(lines),
+            Some(Reply::Text { lines, cursor }) => Ok((lines, cursor)),
             _ => bail!("no text"),
         }
     }
@@ -372,11 +377,21 @@ pub fn run(args: Vec<String>) -> Result<()> {
             let bytes = if raw { keys.into_bytes() } else { keyspec::bytes(&keyspec::parse(&keys)?) };
             conn.ask(&Request::Input { id, bytes })?;
         }
-        Cmd::Read { target: t, lines } => {
+        Cmd::Read { target: t, lines, cursor } => {
             let id = target(&mut conn, &t)?;
-            let text = conn.read(id, lines != Lines::Screen)?;
+            let (text, (row, col)) = conn.read(id, lines != Lines::Screen)?;
             let n = if let Lines::Last(n) = lines { Some(n) } else { None };
             trim(text, n).iter().for_each(|l| println!("{l}"));
+            if cursor {
+                println!("(cursor {row},{col})");
+            }
+        }
+        Cmd::Vt(t) => {
+            let id = target(&mut conn, &t)?;
+            match conn.ask(&Request::Exact { id })?.into_iter().next() {
+                Some(Reply::Screen(screen)) => std::io::stdout().write_all(&screen.bytes)?,
+                _ => bail!("no screen"),
+            }
         }
         Cmd::Wait { target: t, until, timeout } => {
             // ids aren't reused, so one that's gone already exited
@@ -409,7 +424,7 @@ fn wait(conn: &mut Conn, id: u64, until: Until, timeout: Option<Duration>) -> Re
     let mut last: (Vec<String>, Instant) = (Vec::new(), start);
     // how long the screen has looked the same
     let mut still = |conn: &mut Conn| -> Result<Duration> {
-        let text = conn.read(id, false)?;
+        let text = conn.read(id, false)?.0;
         if text != last.0 {
             last = (text, Instant::now());
         }
@@ -423,7 +438,7 @@ fn wait(conn: &mut Conn, id: u64, until: Until, timeout: Option<Duration>) -> Re
                 term.fg.is_none() && quiet >= SETTLE
             }
             Until::Exit => !conn.list()?.iter().any(|t| t.id == id),
-            Until::Match(_) => matches(re.as_ref().expect("built above"), &conn.read(id, false)?),
+            Until::Match(_) => matches(re.as_ref().expect("built above"), &conn.read(id, false)?.0),
             Until::Idle(idle) => still(conn)? >= *idle,
         };
         if done {
@@ -464,11 +479,13 @@ mod tests {
         assert_eq!(parse(args("new")).unwrap().1, Cmd::New { name: "Untitled".into(), cwd: None, cmd: None });
         assert_eq!(parse(args("rename 2 api")).unwrap().1, Cmd::Rename("2".into(), "api".into()));
         assert_eq!(parse(args("send web ls <CR>")).unwrap().1, Cmd::Send { target: "web".into(), keys: "ls<CR>".into(), raw: false });
-        assert_eq!(parse(args("read . --lines 5")).unwrap().1, Cmd::Read { target: ".".into(), lines: Lines::Last(5) });
+        assert_eq!(parse(args("read . --lines 5")).unwrap().1, Cmd::Read { target: ".".into(), lines: Lines::Last(5), cursor: false });
         assert_eq!(
             parse(args("wait %3 --idle 500ms --timeout 1m")).unwrap().1,
             Cmd::Wait { target: "%3".into(), until: Until::Idle(Duration::from_millis(500)), timeout: Some(Duration::from_secs(60)) }
         );
+        assert_eq!(parse(args("read 2 --cursor")).unwrap().1, Cmd::Read { target: "2".into(), lines: Lines::Screen, cursor: true });
+        assert_eq!(parse(args("read 2 --vt")).unwrap().1, Cmd::Vt("2".into()));
         assert_eq!(parse(args("wait . --done")).unwrap().1, Cmd::Wait { target: ".".into(), until: Until::Done, timeout: None });
         assert_eq!(parse(args("apply web --prune")).unwrap().1, Cmd::Apply { workflow: "web".into(), prune: true });
         assert_eq!(parse(args("save")).unwrap().1, Cmd::Save(None));
@@ -476,7 +493,7 @@ mod tests {
 
     #[test]
     fn rejects_bad_args() {
-        for bad in ["", "frob", "kill", "kill a b", "ls --bogus", "ls extra", "read a --all --lines 2", "wait a", "wait a --exit --idle 1s", "wait a --done --exit", "send a", "-s"] {
+        for bad in ["", "frob", "kill", "kill a b", "ls --bogus", "ls extra", "read a --all --lines 2", "wait a", "wait a --exit --idle 1s", "wait a --done --exit", "read a --vt --all", "send a", "-s"] {
             assert!(parse(args(bad)).is_err(), "{bad}");
         }
     }

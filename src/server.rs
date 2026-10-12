@@ -12,6 +12,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 
+use crate::dump;
 use crate::mux::{Mux, PtyEvent, Term};
 use crate::outbox::Outbox;
 use crate::protocol::{self, Entry, List, Reply, Request, Screen, Start};
@@ -278,7 +279,13 @@ impl Server {
                 let t = self.mux.get_mut(id).with_context(|| format!("no terminal %{id}"))?;
                 let screen = t.vt.screen_mut();
                 let lines = if scrollback { vt::text(screen) } else { screen.rows(0, screen.size().1).collect() };
-                self.send(cid, &Reply::Text { lines });
+                let cursor = screen.cursor_position();
+                self.send(cid, &Reply::Text { lines, cursor });
+            }
+            Request::Exact { id } => {
+                let t = self.mux.get_mut(id).with_context(|| format!("no terminal %{id}"))?;
+                let bytes = dump::exact(&mut t.vt);
+                self.send(cid, &Reply::Screen(Screen { id, bytes }));
             }
             Request::Apply { terms, prune } => {
                 let terms = Start { terms, ..Start::default() }.session().terms;
@@ -648,7 +655,7 @@ mod tests {
         let deadline = std::time::Instant::now() + TIMEOUT;
         loop {
             ctl.send(Request::Read { id: dev, scrollback: false });
-            let lines = ctl.until(|r| if let Reply::Text { lines } = r { Some(lines) } else { None });
+            let lines = ctl.until(|r| if let Reply::Text { lines, .. } = r { Some(lines) } else { None });
             if lines.iter().any(|l| l.trim() == "ctl-42") {
                 break;
             }

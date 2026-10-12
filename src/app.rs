@@ -398,7 +398,7 @@ impl App {
                 }
                 true
             }
-            Reply::Info { .. } | Reply::Text { .. } => false,
+            Reply::Info { .. } | Reply::Text { .. } | Reply::Screen(_) => false,
         }
     }
 
