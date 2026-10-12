@@ -59,6 +59,8 @@ pub struct App {
     alt: Option<u64>,
     /// list row to open once the user answers the write prompt
     confirm: Option<usize>,
+    /// the terminal the server opens next came from the list's `<CR>`, so it opens in view n
+    opening_normal: bool,
     /// `<C-p>`'s fuzzy finder, drawn over the terminal it has selected
     picker: Option<Picker>,
     /// `:w`s sent whose list hasn't come back, which replaces the list buffer's edits rather than rebasing them
@@ -127,6 +129,7 @@ impl App {
             last: None,
             alt: None,
             confirm: None,
+            opening_normal: false,
             picker: None,
             writing: 0,
             focused: None,
@@ -264,7 +267,8 @@ impl App {
             p.cwds(|id| self.remote.get(id).map(|t| workflow::tilde(&t.cwd)));
         }
         if list.open.is_some() {
-            self.open(list.open);
+            let normal = std::mem::take(&mut self.opening_normal);
+            self.open(list.open, normal);
         }
     }
 
@@ -761,7 +765,7 @@ impl App {
                     } else if self.list.modified() {
                         self.write_open(row);
                     } else {
-                        self.open(self.list.lines.get(row).and_then(|l| l.id));
+                        self.open(self.list.lines.get(row).and_then(|l| l.id), true);
                     }
                 }
                 Effect::Write => {
@@ -789,6 +793,7 @@ impl App {
     /// `:e name` / `:new name`: views the terminal called `name`, or spawns it at the end of the list in `from`'s
     /// directory, opened once the server sends the list with it.
     fn edit(&mut self, name: String, new: bool, from: Option<u64>) {
+        self.opening_normal = false;
         if let Some(id) = self.remote.terms().iter().find(|t| !new && t.name == name).map(|t| t.id) {
             self.set_view(View::Insert(id));
             return;
@@ -796,8 +801,9 @@ impl App {
         self.remote.send(&Request::Spawn { name, from, cwd: None, cmd: None });
     }
 
-    fn open(&mut self, id: Option<u64>) {
+    fn open(&mut self, id: Option<u64>, normal: bool) {
         match id.filter(|id| self.alive(*id)) {
+            Some(id) if normal => self.enter_normal(id),
             Some(id) => self.set_view(View::Insert(id)),
             None => self.list.message = Some("nothing to open on this line".into()),
         }
@@ -826,9 +832,10 @@ impl App {
     /// Writes, then opens row `row`'s terminal, which a blank row doesn't have.
     fn write_open(&mut self, row: usize) {
         let blank = self.list.lines.get(row).is_none_or(|l| l.text.trim().is_empty());
+        self.opening_normal = !blank;
         self.write((!blank).then_some(row));
         if blank {
-            self.open(None);
+            self.open(None, true);
         }
     }
 

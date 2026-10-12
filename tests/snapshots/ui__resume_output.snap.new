@@ -1,0 +1,18 @@
+---
+source: tests/ui.rs
+assertion_line: 280
+expression: vix.screen()
+---
+$ echo persisted
+persisted
+$
+-- restored --
+$
+
+
+
+
+
+
+                                                     1 keep
+[cursor 4,1]

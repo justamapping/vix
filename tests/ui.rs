@@ -157,7 +157,7 @@ fn list_write_renames_clones_and_spawns() {
     assert_snapshot!("write_staged", vix.screen());
     vix.keys(":w\r");
     assert_snapshot!("write_written", vix.screen());
-    vix.keys("\r").keys("echo hi\r");
+    vix.keys("\ri").keys("echo hi\r");
     assert_snapshot!("write_view_i", vix.screen());
     vix.keys("\x1c");
     assert_snapshot!("write_view_n", vix.screen());
@@ -207,7 +207,7 @@ fn exits_keep_unsaved_edits() {
 fn view_n_motions_and_search() {
     let home = Home::new();
     let mut vix = Vix::start(&home, &[]);
-    vix.keys("\r").keys("echo one\r").keys("echo two\r").keys("\x1c");
+    vix.keys("\ri").keys("echo one\r").keys("echo two\r").keys("\x1c");
     vix.keys("gg");
     assert_snapshot!("view_n_top", vix.screen());
     vix.keys("/two\r");
@@ -272,7 +272,7 @@ fn workflow_save_and_load() {
 fn resume_restores_names_and_output() {
     let home = Home::new();
     let mut vix = Vix::start(&home, &[]);
-    vix.keys("cwkeep\x1b").keys(":w\r").keys("\r").keys("echo persisted\r").keys("\x1c").keys(":qa\r");
+    vix.keys("cwkeep\x1b").keys(":w\r").keys("\ri").keys("echo persisted\r").keys("\x1c").keys(":qa\r");
     assert!(vix.exited());
     let mut vix = Vix::start(&home, &["-r"]);
     assert_snapshot!("resume_list", vix.screen());
@@ -284,7 +284,7 @@ fn resume_restores_names_and_output() {
 fn detach_and_reattach_keep_the_screen() {
     let home = Home::new();
     let mut vix = Vix::start(&home, &["demo"]);
-    vix.keys("\r").keys("echo kept\r");
+    vix.keys("\ri").keys("echo kept\r");
     let before = vix.screen();
     assert!(before.contains("$ echo kept\nkept\n$"), "{before}");
     vix.keys("\x1c").keys(":qd\r");
@@ -313,7 +313,7 @@ fn list_attach_and_nesting() {
 
     // from a shell inside session 0
     let mut vix = Vix::sized(&home, &[], 120, 12);
-    vix.keys("\r").keys(&format!("{vix_bin} -l\r"));
+    vix.keys("\ri").keys(&format!("{vix_bin} -l\r"));
     let screen = vix.screen();
     assert!(screen.contains("\n0: 1 terminal (attached)\ndemo: 1 terminal\n"), "{screen}");
     vix.keys(&format!("{vix_bin} -a 0\r"));
