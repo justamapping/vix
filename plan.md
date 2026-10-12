@@ -221,6 +221,7 @@ vix ctl wait <t> --done | --match pat | --idle 2s | --exit   [--timeout]
 vix ctl run <t> 'npm test'               (needs shell integration) send + wait for the prompt, output, exit status
 vix ctl apply <workflow|file> [--prune] | save <workflow>
 vix ctl sessions | detach | kill-session
+vix ctl kill-all                         every session, then stray vix servers (sockets gone), its own session last
 ```
 
 Built as written, except `run`, which waits on shell integration. `wait` polls `read` every
@@ -229,7 +230,7 @@ Built as written, except `run`, which waits on shell integration. `wait` polls `
 while a full-screen program or REPL is in front. `--match` is a regex over the screen (multi-line, so `^$` work per row), `--idle` is the screen unchanged
 that long, `--exit` is the id gone from the list (a `%id` already gone counts, ids aren't reused). `new` defaults
 to ctl's own directory and prints the `%id`. `apply` matches by name, appends what's missing, `--prune` kills the
-rest; it doesn't reorder.
+rest; it doesn't reorder. `kill-session` and `kill-all` skip the version check, so they reach servers from older builds.
 
 `scripts/drive` is the dev harness on top of it (it replaced `examples/drive.rs`): a scratch session from `vix -d -x -y`,
 vix typed into it, then `send`, `wait --idle`, `read --cursor` per step, and `read --vt` for `tests/screens`. The

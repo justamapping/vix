@@ -1,8 +1,10 @@
 //! `vix ctl`: drives a running session from scripts and agents, one request at a time, without attaching.
 
-use std::io::{BufReader, Write};
+use std::collections::HashMap;
+use std::io::{BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -27,9 +29,12 @@ pub const USAGE: &str = "usage: vix ctl [-s session] <verb>
   apply <workflow|file.toml> [--prune] spawns what's missing by name
   save [workflow]
   sessions | detach | kill-session
+  kill-all                             every session, then any vix server left running, this session last
 a target <t> is a name, an index from 1, %id, or . for the terminal ctl runs in.
 the session is -s, else the one ctl runs in, else the only one running.";
 
+// how long a server gets to exit before kill-all moves on, then SIGKILLs it
+const GRACE: Duration = Duration::from_secs(1);
 // how often `wait` looks
 const POLL: Duration = Duration::from_millis(100);
 // how long the shell must be in the foreground with a still screen for `wait --done`, so a command that was just sent has time to start
@@ -50,6 +55,7 @@ pub enum Cmd {
     Sessions,
     Detach,
     KillSession,
+    KillAll,
 }
 
 #[derive(Debug, PartialEq)]
@@ -173,12 +179,13 @@ pub fn parse(args: Vec<String>) -> Result<(Option<String>, Cmd)> {
             Cmd::Apply { workflow: a.done(1, 1)?.remove(0), prune }
         }
         "save" => Cmd::Save(a.done(0, 1)?.pop()),
-        "sessions" | "detach" | "kill-session" => {
+        "sessions" | "detach" | "kill-session" | "kill-all" => {
             a.done(0, 0)?;
             match verb.as_str() {
                 "sessions" => Cmd::Sessions,
                 "detach" => Cmd::Detach,
-                _ => Cmd::KillSession,
+                "kill-session" => Cmd::KillSession,
+                _ => Cmd::KillAll,
             }
         }
         _ => bail!("unknown verb {verb}"),
@@ -338,10 +345,17 @@ pub fn run(args: Vec<String>) -> Result<()> {
     }
     let dir = sock::dir()?;
     let inside = sock::inside(&dir, std::env::var_os("VIX_SOCKET").as_deref().map(Path::new));
+    if cmd == Cmd::KillAll {
+        return kill_all(&dir, inside.as_deref());
+    }
     let live: Vec<String> = if session.is_some() || inside.is_some() { Vec::new() } else { sock::sessions(&dir)?.into_iter().map(|(n, _)| n).collect() };
     let name = pick(session, inside.clone(), &live)?;
     let own = if inside.as_deref() == Some(name.as_str()) { std::env::var("VIX_ID").ok().and_then(|id| id.parse().ok()) } else { None };
-    let mut conn = Conn::open(&sock::path(&dir, &name)?, &name)?;
+    let path = sock::path(&dir, &name)?;
+    if cmd == Cmd::KillSession {
+        return kill_session(sock::connect(&path)?.with_context(|| format!("no session {name}"))?);
+    }
+    let mut conn = Conn::open(&path, &name)?;
     let target = |conn: &mut Conn, t: &str| conn.list().and_then(|terms| resolve(&terms, t, own));
     match cmd {
         Cmd::Ls { json } => {
@@ -408,10 +422,72 @@ pub fn run(args: Vec<String>) -> Result<()> {
         }
         Cmd::Save(workflow) => print_messages(conn.ask(&Request::Save { workflow, cursor: 0 })?),
         Cmd::Detach => _ = conn.ask(&Request::DetachAll)?,
-        Cmd::KillSession => _ = conn.ask(&Request::KillSession { cursor: 0 })?,
-        Cmd::Sessions => unreachable!("handled before connecting"),
+        Cmd::Sessions | Cmd::KillSession | Cmd::KillAll => unreachable!("handled before connecting"),
     }
     Ok(())
+}
+
+/// Asks a server to kill its session and waits for it to hang up. Skips the version check: this message is the
+/// same in every protocol, so servers from older builds still get it.
+fn kill_session(stream: UnixStream) -> Result<()> {
+    stream.set_read_timeout(Some(GRACE))?;
+    protocol::send(&mut &stream, &Request::KillSession { cursor: 0 })?;
+    let _ = (&stream).read_to_end(&mut Vec::new());
+    Ok(())
+}
+
+/// `kill-all`: every session in `dir`, then every vix server still running as this user (a socket gone, another
+/// runtime dir), the session ctl runs in last since it takes ctl with it.
+fn kill_all(dir: &Path, inside: Option<&str>) -> Result<()> {
+    let (own, others): (Vec<_>, Vec<_>) = sock::sessions(dir)?.into_iter().partition(|(name, _)| Some(name.as_str()) == inside);
+    for (name, stream) in others {
+        match kill_session(stream) {
+            Ok(()) => println!("killed session {name}"),
+            Err(e) => println!("session {name}: {e:#}"),
+        }
+    }
+    let ps = Command::new("ps").args(["-axo", "pid=,ppid=,uid=,command="]).output().context("running ps")?;
+    let stray = strays(&String::from_utf8_lossy(&ps.stdout), unsafe { libc::getuid() }, std::process::id());
+    let alive = |pid: &u32| unsafe { libc::kill(*pid as i32, 0) } == 0;
+    stray.iter().for_each(|&pid| _ = unsafe { libc::kill(pid as i32, libc::SIGTERM) });
+    let start = Instant::now();
+    while stray.iter().any(alive) && start.elapsed() < GRACE {
+        thread::sleep(POLL);
+    }
+    stray.iter().filter(|pid| alive(pid)).for_each(|&pid| _ = unsafe { libc::kill(pid as i32, libc::SIGKILL) });
+    if !stray.is_empty() {
+        println!("killed {} stray servers", stray.len());
+    }
+    for (name, stream) in own {
+        println!("killing session {name}, this one");
+        kill_session(stream)?;
+    }
+    Ok(())
+}
+
+/// Vix servers `uid` runs, from `ps -axo pid=,ppid=,uid=,command=`, except `me`'s ancestors (the server of the
+/// session ctl runs in).
+pub fn strays(ps: &str, uid: u32, me: u32) -> Vec<u32> {
+    let rows: Vec<(u32, u32, u32, Vec<&str>)> = ps
+        .lines()
+        .filter_map(|line| {
+            let mut f = line.split_whitespace();
+            Some((f.next()?.parse().ok()?, f.next()?.parse().ok()?, f.next()?.parse().ok()?, f.collect()))
+        })
+        .collect();
+    let parent: HashMap<u32, u32> = rows.iter().map(|(pid, ppid, ..)| (*pid, *ppid)).collect();
+    let mut ancestors = Vec::new();
+    let mut pid = me;
+    while let Some(&ppid) = parent.get(&pid).filter(|_| pid > 1 && ancestors.len() < 64) {
+        ancestors.push(ppid);
+        pid = ppid;
+    }
+    rows.iter()
+        .filter(|(pid, _, owner, argv)| {
+            *owner == uid && argv.get(1) == Some(&"--server") && argv[0].rsplit('/').next() == Some("vix") && !ancestors.contains(pid)
+        })
+        .map(|(pid, ..)| *pid)
+        .collect()
 }
 
 /// Polls until `until` holds for terminal `id`, or `timeout` passes.
@@ -493,7 +569,7 @@ mod tests {
 
     #[test]
     fn rejects_bad_args() {
-        for bad in ["", "frob", "kill", "kill a b", "ls --bogus", "ls extra", "read a --all --lines 2", "wait a", "wait a --exit --idle 1s", "wait a --done --exit", "read a --vt --all", "send a", "-s"] {
+        for bad in ["", "frob", "kill", "kill a b", "ls --bogus", "ls extra", "read a --all --lines 2", "wait a", "wait a --exit --idle 1s", "wait a --done --exit", "read a --vt --all", "kill-all now", "send a", "-s"] {
             assert!(parse(args(bad)).is_err(), "{bad}");
         }
     }
@@ -525,6 +601,23 @@ mod tests {
         assert_eq!(pick(None, None, &["0".into()]).unwrap(), "0");
         assert!(pick(None, None, &[]).is_err());
         assert!(pick(None, None, &["0".into(), "web".into()]).unwrap_err().to_string().contains("-s"));
+    }
+
+    #[test]
+    fn strays_skip_own_server_and_others() {
+        let ps = "\
+    1     0   0 /sbin/launchd
+   10     1 501 /Users/me/.cargo/bin/vix --server 1
+   11    10 501 -zsh
+   12    11 501 vix ctl kill-all
+   20     1 501 /tmp/target/debug/vix --server 0
+   21     1 501 vix --server drive-9
+   30     1   0 /usr/local/bin/vix --server 0
+   40     1 501 nvim --server /tmp/nvim.sock
+   41     1 501 vix-old --server 0
+   42    11 501 vix ctl ls";
+        assert_eq!(strays(ps, 501, 12), [20, 21]);
+        assert_eq!(strays(ps, 501, 99), [10, 20, 21]);
     }
 
     #[test]
