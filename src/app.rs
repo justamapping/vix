@@ -11,6 +11,7 @@ use crate::buffer::{self, Buffer, Effect, Line};
 use crate::carry::Spot;
 use crate::client::{self, Remote, Term};
 use crate::config::Config;
+use crate::cwds;
 use crate::follow;
 use crate::input::{self, Input, Key, Mouse, MouseKind};
 use crate::listdiff;
@@ -204,6 +205,8 @@ impl App {
 
     fn go_list(&mut self, id: u64) {
         self.view = View::List;
+        // for the directories next to the names
+        self.remote.send(&Request::Refresh);
         if let Some(row) = self.list.lines.iter().position(|l| l.id == Some(id)) {
             self.list.place((row, 0), self.list.top);
         }
@@ -571,6 +574,7 @@ impl App {
                     None => self.normal.message = Some(format!("no terminal {n}")),
                 },
                 Effect::Pick => self.pick(),
+                Effect::Notified => self.notified(Some(id)),
                 Effect::Delete(name) => self.delete(id, name),
                 Effect::Rename(name) => self.rename(id, name),
                 Effect::Change { change, insert } => {
@@ -584,6 +588,26 @@ impl App {
             }
         }
         Ok(())
+    }
+
+    /// The list's directory per row, for rows that are running terminals.
+    fn notes(&self) -> Vec<Option<String>> {
+        let terms: Vec<_> = self.list.lines.iter().filter_map(|l| self.remote.get(l.id?)).collect();
+        let cwds: Vec<_> = terms.iter().map(|t| workflow::tilde(&t.cwd)).collect();
+        let pairs: Vec<_> = terms.iter().zip(&cwds).map(|(t, c)| (t.name.as_str(), c.as_str())).collect();
+        let mut labels = cwds::labels(&pairs).into_iter();
+        self.list.lines.iter().map(|l| l.id.and_then(|id| self.remote.get(id)).and_then(|_| labels.next()?)).collect()
+    }
+
+    /// `<Tab>`: views the next terminal after `from` that rang or has unseen output.
+    fn notified(&mut self, from: Option<u64>) {
+        let flags: Vec<_> = self.remote.terms().iter().map(|t| (t.bell, t.activity)).collect();
+        let current = from.and_then(|id| self.remote.position(id));
+        match state::notifying(&flags, current) {
+            Some(i) => self.enter_normal(self.remote.terms()[i].id),
+            None if self.viewing().is_some() => self.normal.message = Some("no notifications".into()),
+            None => self.list.message = Some("no notifications".into()),
+        }
     }
 
     /// Moves a line editor's cursor to where `i a I A` asked, when that's on its line; anywhere else it stays put.
@@ -784,6 +808,7 @@ impl App {
                 Effect::Reload => self.list.load(self.lines()),
                 Effect::Edit { name, new } => self.edit(name, new, None),
                 Effect::Pick => self.pick(),
+                Effect::Notified => self.notified(self.last),
                 _ => {}
             }
         }
@@ -882,6 +907,7 @@ impl App {
         }
         self.refresh_normal();
         let bar = self.bar();
+        let notes = self.notes();
         if let Some(p) = &self.picker {
             // typing keeps what you were looking at; moving the selection previews it
             let shown = if p.browsing { p.selection() } else { self.viewing() };
@@ -889,7 +915,7 @@ impl App {
             terminal.draw(|f| {
                 match (preview, &bar) {
                     (Some(t), bar) => render::term(f, t.vt.screen(), None, bar.as_ref()),
-                    (None, Some(bar)) if self.view == View::List => render::list(f, &self.list, bar),
+                    (None, Some(bar)) if self.view == View::List => render::list(f, &self.list, &notes, bar),
                     _ => {}
                 }
                 render::picker(f, p);
@@ -901,7 +927,7 @@ impl App {
             View::List => {
                 let insert = self.list.mode == buffer::Mode::Insert;
                 let bar = bar.as_ref().expect("the list always has a bar");
-                terminal.draw(|f| render::list(f, &self.list, bar))?;
+                terminal.draw(|f| render::list(f, &self.list, &notes, bar))?;
                 self.mouse_modes(Modes { cursor_shape: if insert { 6 } else { 0 }, ..Default::default() })
             }
             View::Normal(id) => {

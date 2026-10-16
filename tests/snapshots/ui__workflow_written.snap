@@ -2,8 +2,8 @@
 source: tests/ui.rs
 expression: vix.screen()
 ---
-web
-api
+web  work
+api  work
 ~
 ~
 ~

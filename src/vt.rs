@@ -5,7 +5,8 @@ pub type Parser = vt100::Parser<Callbacks>;
 
 pub const SCROLLBACK: usize = 10_000;
 
-/// Collects what vt100 doesn't handle itself: replies to terminal queries, the cursor shape, and bells.
+/// Collects what vt100 doesn't handle itself: replies to terminal queries, the cursor shape, and bells (desktop
+/// notifications count as bells).
 #[derive(Default)]
 pub struct Callbacks {
     pub replies: Vec<u8>,
@@ -38,6 +39,20 @@ impl vt100::Callbacks for Callbacks {
             (Some(b' '), 'q', shape) => self.cursor_shape = shape,
             _ => {}
         }
+    }
+
+    fn unhandled_osc(&mut self, _: &mut vt100::Screen, params: &[&[u8]]) {
+        self.bell |= notification(params);
+    }
+}
+
+/// iTerm2's OSC 9 (not ConEmu's numbered 9;n subcommands like progress), rxvt's 777;notify, kitty's 99.
+fn notification(params: &[&[u8]]) -> bool {
+    let numeric = |p: &[u8]| !p.is_empty() && p.iter().all(u8::is_ascii_digit);
+    match params {
+        [b"9", rest @ ..] => !rest.first().is_some_and(|p| numeric(p)),
+        [b"777", b"notify", ..] | [b"99", ..] => true,
+        _ => false,
     }
 }
 
@@ -167,6 +182,16 @@ mod tests {
         assert_eq!(index(p.screen(), 0, 3), 2);
         assert_eq!(column(p.screen(), 0, 2), 3);
         assert_eq!(column(p.screen(), 0, 100), 80);
+    }
+
+    #[test]
+    fn notifications_ring() {
+        let rang = |b: &[u8]| feed(b).callbacks().bell;
+        assert!(rang(b"\x1b]9;done\x07"));
+        assert!(rang(b"\x1b]777;notify;Claude;waiting\x1b\\"));
+        assert!(rang(b"\x1b]99;;hi\x07"));
+        assert!(!rang(b"\x1b]9;4;1;50\x07"));
+        assert!(!rang(b"\x1b]7;file:///tmp\x07"));
     }
 
     #[test]

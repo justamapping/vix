@@ -51,6 +51,8 @@ pub enum Effect {
     Parent,
     Switch(isize),
     Alternate,
+    /// `<Tab>` goes to the next terminal that rang or has unseen output, from view n or the list
+    Notified,
     Goto(usize),
     /// `<C-p>` opens the terminal picker
     Pick,
@@ -450,6 +452,7 @@ impl Buffer {
             Action::Parent => return vec![Effect::Parent],
             Action::Switch { back } => return vec![Effect::Switch(if back { -(n as isize) } else { n as isize })],
             Action::Alternate => return vec![Effect::Alternate],
+            Action::Notified => return vec![Effect::Notified],
             Action::Pick => return vec![Effect::Pick],
         }
         vec![]
@@ -1154,6 +1157,7 @@ mod tests {
         feed(&mut b, "$0");
         assert_eq!(b.cursor.1, 0);
         assert_eq!(feed(&mut b, "\x1e"), vec![Effect::Alternate]);
+        assert_eq!(feed(&mut b, "\t"), vec![Effect::Notified]);
         assert_eq!(feed(&mut b, "yy"), vec![Effect::Yank("$ ls\n".into())]);
         assert_eq!(feed(&mut b, ":x\r"), vec![Effect::Quit { force: false }]);
         assert_eq!(feed(&mut b, ":xd\r"), vec![Effect::Detach { force: false }]);

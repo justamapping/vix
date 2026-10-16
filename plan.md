@@ -30,6 +30,7 @@ view n   --:d [n]--> view n      kills (named) terminal, moves to alternate/neig
 view n   --J/K-->    view n      next/prev terminal, counts work (3J)
 view n   --1-9-->    view n      chrome's cmd+1-9, 9 is last
 view n   --<C-^>-->  view n      alternate terminal
+view n   --<Tab>-->  view n      next terminal that rang, else with unseen output (also from the list)
 any      --<C-p>-->  picker      fuzzy over name + cwd, previews the selection
 any      --:qa-->    quit vix    (:q only quits from the list)
 ```
@@ -37,12 +38,13 @@ any      --:qa-->    quit vix    (:q only quits from the list)
 ## built
 
 - **list**: names with hidden stable ids; `:w` diffs into kill / rename / clone / spawn / reorder (`listdiff`).
-  `<CR>` on a modified list asks first. `:e name`, `:new name` from anywhere.
+  `<CR>` on a modified list asks first. `:e name`, `:new name` from anywhere. Each row shows its directory as
+  virtual text (`cwds`): the fewest trailing components that tell it apart, hidden when it's the name.
 - **view n**: read-only buffer over scrollback + screen, follows live output at the bottom, pinned elsewhere.
   Motions, visual, search, yank via OSC 52, `:r name`, `:d [name]`. Mouse: wheel scrolls into view n, drag selects.
 - **config**: `~/.config/vix/config.toml`, vim key notation, non-recursive maps per mode, `escape`, `timeoutlen`,
   `mouse`, `incsearch`, `hlsearch` (both on, `:noh`), status templates. `<C-\>` returns to normal from any mode. A broken config falls back to defaults and says why.
-- **status bar**: vim-tabline tabs (current reversed, activity bold, bell yellow), slides around the current
+- **status bar**: vim-tabline tabs (current reversed, activity bold, bell yellow; OSC 9/777/99 notifications ring), slides around the current
   terminal when it overflows. Fields `{mode} {name} {index} {total} {modified} {workflow} {terms}`.
 - **resume**: `vix -r` restores names, live cwd (pid -> cwd like tmux), and scrollback (`dump`), not programs.
 - **workflows**: `:w name` saves the list to `~/.config/vix/workflows/name.toml`, after which `:w` keeps saving

@@ -2,9 +2,9 @@
 source: tests/ui.rs
 expression: vix.screen()
 ---
-foo
-api
-logs
+foo  work
+api  work
+logs  work
 ~
 ~
 ~

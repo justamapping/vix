@@ -24,9 +24,28 @@ pub fn goto(n: usize, len: usize) -> Option<usize> {
     (i < len).then_some(i)
 }
 
+/// `<Tab>`: the next terminal after `current` that rang, else the next with unseen output, wrapping around.
+/// Same priority as the bar's yellow then bold tabs. `flags` is `(bell, activity)` per terminal in list order.
+pub fn notifying(flags: &[(bool, bool)], current: Option<usize>) -> Option<usize> {
+    let start = current.map_or(0, |c| c + 1);
+    let order = || (0..flags.len()).map(|i| (start + i) % flags.len()).filter(|&i| Some(i) != current);
+    order().find(|&i| flags[i].0).or_else(|| order().find(|&i| flags[i].1))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn notifying_prefers_bells_then_wraps() {
+        let (none, bell, out) = ((false, false), (true, false), (false, true));
+        assert_eq!(notifying(&[out, none, bell], Some(1)), Some(2));
+        assert_eq!(notifying(&[bell, out, bell], Some(0)), Some(2));
+        assert_eq!(notifying(&[bell, out, none], Some(2)), Some(0));
+        assert_eq!(notifying(&[none, out, none], None), Some(1));
+        assert_eq!(notifying(&[bell, none], Some(0)), None);
+        assert_eq!(notifying(&[], None), None);
+    }
 
     #[test]
     fn goto_is_chrome_like() {

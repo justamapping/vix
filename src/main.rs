@@ -4,6 +4,7 @@ mod carry;
 mod client;
 mod config;
 mod ctl;
+mod cwds;
 mod dump;
 mod follow;
 mod input;

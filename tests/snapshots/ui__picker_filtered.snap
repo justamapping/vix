@@ -2,9 +2,9 @@
 source: tests/ui.rs
 expression: vix.screen()
 ---
-web
-api
-logs
+web  work
+api  work
+logs  work
 ~
 ~ ┌ terminals ───────────────────────────────────────────┐
 ~ │> ap                                                  │

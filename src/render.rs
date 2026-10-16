@@ -136,14 +136,17 @@ fn cursor(frame: &mut Frame, buf: &Buffer, top: usize) {
     frame.set_cursor_position(at);
 }
 
-pub fn list(frame: &mut Frame, buf: &Buffer, bar: &Bar) {
+/// `notes` is virtual text after each row (the terminal's directory), like vim's diagnostics.
+pub fn list(frame: &mut Frame, buf: &Buffer, notes: &[Option<String>], bar: &Bar) {
     let area = frame.area();
     let height = area.height.saturating_sub(1);
     let tilde = Style::new().fg(Color::Blue);
+    let note = Style::new().fg(Color::Magenta);
     let rows: Vec<Line> = (buf.top..buf.top + height as usize)
-        .map(|i| match buf.lines.get(i) {
-            Some(l) => Line::raw(l.text.as_str()),
-            None => Line::styled("~", tilde),
+        .map(|i| match (buf.lines.get(i), notes.get(i).and_then(Option::as_deref)) {
+            (Some(l), Some(n)) => Line::from(vec![Span::raw(l.text.as_str()), Span::styled(format!("  {n}"), note)]),
+            (Some(l), None) => Line::raw(l.text.as_str()),
+            (None, _) => Line::styled("~", tilde),
         })
         .collect();
     frame.render_widget(Paragraph::new(rows), area);

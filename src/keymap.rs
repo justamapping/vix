@@ -106,6 +106,7 @@ pub enum Action {
     Parent,
     Switch { back: bool },
     Alternate,
+    Notified,
     Pick,
 }
 
@@ -195,6 +196,7 @@ pub fn parse(keys: &[Key]) -> Parsed {
         Key::Char('J') => done(Action::Switch { back: false }),
         Key::Char('K') => done(Action::Switch { back: true }),
         Key::Ctrl('^') => done(Action::Alternate),
+        Key::Tab => done(Action::Notified),
         Key::Ctrl('p') => done(Action::Pick),
         Key::Ctrl('e') => done(Action::Scroll(Scroll::LineDown)),
         Key::Ctrl('y') => done(Action::Scroll(Scroll::LineUp)),
