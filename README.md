@@ -9,7 +9,9 @@ of your terminals that you can name by using a vim-like editor, then go into by 
 To understand how to maneuver using vix, type `vix --keys` in the terminal, or type :h in command mode
 when inside vix.
 
-There are a two primary states inside of vix to know
+## States
+
+There are a two primary states inside of vix to know:
 
 1. List mode (normal or insert mode), this is for creating new terminal windows via a vim-based text editor.
 Hitting enter will go into view mode inside of the terminal you select
@@ -23,3 +25,6 @@ terminal without any interference until you hit your escape sequence to get back
 ![View Mode](./assets/viewmode.png)
 
 ## Configuration
+
+You can configure vix inside of `~/.config/vix/config.toml`
+An example config to get started is inside of [Examples](./examples/config/config.toml)

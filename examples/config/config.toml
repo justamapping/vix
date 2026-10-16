@@ -1,0 +1,15 @@
+# escape = "<C-\>"     # default
+# timeoutlen = 1000
+
+[map.list]
+";" = ":" # Remap : to ; so you only have to hit one key
+":" = ";" # likewise map ; back to : so we don't lose a key
+
+[map.view]
+";" = ":"
+":" = ";"
+"<C-k>" = "<C-u>" # make scrolling up and down ctrl+k and ctrl+j
+"<C-j>" = "<C-d>"
+
+[map.list_insert]
+jk = "<Esc>" # map jk to Escape like many vim configs
