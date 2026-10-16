@@ -53,6 +53,9 @@ any      --:qa-->    quit vix    (:q only quits from the list)
 - **text objects**: `iw aw iW aW ip ap`, quotes `" ' \``, brackets `( [ { <` (and `b` `B`) with counts, after
   operators and in visual; `r`, `~`. Quotes pair up from the line's start (vim guesses from the cursor), brackets
   don't search forward. Not yet: sentences, tags, visual `r`/`~`, extending a selection with another object.
+- **help**: `:h [topic]` shows the key sheet in a read-only buffer over everything (`q` closes, motions and `/`
+  work, `1`-`9` `<Tab>` `<C-p>` jump from it), `vix --keys` prints it. Rows go through the config's maps, so a
+  swapped `;`/`:` reads `;q`, then the user's own maps are listed. `help.rs`; a test parses every listed key.
 - **`vix ctl`**: ls, new, kill, rename, send, read, wait, apply, save, sessions, detach, kill-session. See "ctl".
 
 ## priorities
@@ -286,6 +289,7 @@ Rust. Pure modules first, I/O at the edges.
 | `remap` / `keyspec` | pure | non-recursive mappings, vim key notation |
 | `status` | pure | bar templates, overflow |
 | `picker` | pure | fuzzy finder over terminals |
+| `help` / `cwds` | pure | `:h`'s key sheet through the user's maps; the list's directory labels |
 | `prompt` | pure | next: the input under the program's cursor; edits -> arrows, backspaces, paste |
 | `follow` / `carry` | pure | view n following output; `i a I A` moving a line editor's cursor |
 | `pty` / `proc` | io | spawn/resize/read/write, pid -> cwd |

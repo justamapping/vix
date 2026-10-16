@@ -13,6 +13,7 @@ use crate::client::{self, Remote, Term};
 use crate::config::Config;
 use crate::cwds;
 use crate::follow;
+use crate::help;
 use crate::input::{self, Input, Key, Mouse, MouseKind};
 use crate::listdiff;
 use crate::motion::Pos;
@@ -64,6 +65,8 @@ pub struct App {
     opening_normal: bool,
     /// `<C-p>`'s fuzzy finder, drawn over the terminal it has selected
     picker: Option<Picker>,
+    /// `:h`'s key sheet, a read-only buffer drawn over everything
+    help: Option<Buffer>,
     /// `:w`s sent whose list hasn't come back, which replaces the list buffer's edits rather than rebasing them
     writing: usize,
     /// what the server was last told this client views
@@ -132,6 +135,7 @@ impl App {
             confirm: None,
             opening_normal: false,
             picker: None,
+            help: None,
             writing: 0,
             focused: None,
             killing: false,
@@ -169,6 +173,9 @@ impl App {
     fn size_buffers(&mut self) {
         self.list.height = self.rows.saturating_sub(1).max(1) as usize;
         self.normal.height = self.term_rows().max(1) as usize;
+        if let Some(h) = &mut self.help {
+            h.height = self.list.height;
+        }
     }
 
     fn lines(&self) -> Vec<Line> {
@@ -326,11 +333,12 @@ impl App {
                 for input in input::split(&bytes, self.config.escape) {
                     self.input(input)?;
                 }
-                let waiting = match self.view {
+                let waiting = match (&self.help, self.view) {
+                    (Some(h), _) => h.waiting(),
                     _ if self.picker.is_some() => false,
-                    View::List => self.list.waiting(),
-                    View::Normal(_) => self.normal.waiting(),
-                    View::Insert(_) => false,
+                    (_, View::List) => self.list.waiting(),
+                    (_, View::Normal(_)) => self.normal.waiting(),
+                    (_, View::Insert(_)) => false,
                 };
                 self.deadline = waiting.then(|| Instant::now() + self.config.timeout);
                 Ok(true)
@@ -412,6 +420,10 @@ impl App {
     /// The mapping timeout passed: run the keys it was holding.
     pub fn flush(&mut self) -> Result<()> {
         self.deadline = None;
+        if let Some(h) = &mut self.help {
+            let effects = h.flush();
+            return self.help_effects(effects);
+        }
         match self.view {
             View::List => {
                 let effects = self.list.flush();
@@ -430,6 +442,9 @@ impl App {
     fn input(&mut self, input: Input) -> Result<()> {
         if self.picker.is_some() {
             return self.picker_input(input);
+        }
+        if self.help.is_some() {
+            return self.help_input(input);
         }
         let bytes = match (self.view, input) {
             (_, Input::Mouse(m)) => return self.mouse(m),
@@ -473,6 +488,84 @@ impl App {
                     self.input(Input::Bytes(bytes[end..].to_vec()))?;
                 }
                 break;
+            }
+        }
+        Ok(())
+    }
+
+    /// `:h [topic]`: the key sheet as the config has it, at the first line mentioning topic.
+    fn help(&mut self, topic: &str) {
+        let lines = help::sheet(&self.config).into_iter().map(|text| Line { id: None, text }).collect();
+        let mut b = Buffer::new(lines);
+        b.readonly = true;
+        b.maps = self.config.view.clone();
+        (b.incsearch, b.hlsearch) = (self.config.incsearch, self.config.hlsearch);
+        b.height = self.list.height;
+        let topic = topic.to_lowercase();
+        let found = b.lines.iter().enumerate().find_map(|(r, l)| Some((r, l.text.to_lowercase().find(&topic)?)));
+        match found {
+            Some((row, at)) if !topic.is_empty() => b.place((row, b.lines[row].text[..at].chars().count()), row),
+            Some(_) => {}
+            None => b.message = Some(format!("E149: Sorry, no help for {topic}")),
+        }
+        self.help = Some(b);
+    }
+
+    fn help_input(&mut self, input: Input) -> Result<()> {
+        let help = self.help.as_mut().expect("checked by the caller");
+        let bytes = match input {
+            Input::Bytes(b) => b,
+            Input::Escape => {
+                help.escape();
+                return Ok(());
+            }
+            Input::Mouse(m) => {
+                if let kind @ (MouseKind::WheelUp | MouseKind::WheelDown) = m.kind() {
+                    help.wheel(kind == MouseKind::WheelDown);
+                }
+                return Ok(());
+            }
+        };
+        for (key, end) in input::spans(&bytes) {
+            let Some(help) = self.help.as_mut() else { break };
+            let effects = help.key(key);
+            self.help_effects(effects)?;
+            if self.help.is_none() {
+                if end < bytes.len() {
+                    self.input(Input::Bytes(bytes[end..].to_vec()))?;
+                }
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    /// `q` and `:q` close the sheet; moving to a terminal or leaving vix closes it and happens underneath.
+    fn help_effects(&mut self, effects: Vec<Effect>) -> Result<()> {
+        for effect in effects {
+            match effect {
+                Effect::Parent | Effect::Quit { .. } => self.help = None,
+                Effect::Help(topic) => self.help(&topic),
+                Effect::Yank(text) => {
+                    let mut out = io::stdout();
+                    out.write_all(&vt::osc52(&text))?;
+                    out.flush()?;
+                }
+                e @ (Effect::Goto(_)
+                | Effect::Switch(_)
+                | Effect::Alternate
+                | Effect::Notified
+                | Effect::Pick
+                | Effect::Edit { .. }
+                | Effect::QuitAll { .. }
+                | Effect::Detach { .. }) => {
+                    self.help = None;
+                    match self.viewing() {
+                        Some(id) => self.normal_effects(id, vec![e])?,
+                        None => self.list_effects(vec![e])?,
+                    }
+                }
+                _ => {}
             }
         }
         Ok(())
@@ -584,6 +677,7 @@ impl App {
                         self.set_view(View::Insert(id));
                     }
                 }
+                Effect::Help(topic) => self.help(&topic),
                 Effect::Open(_) | Effect::Write | Effect::Save(_) => {}
             }
         }
@@ -809,6 +903,7 @@ impl App {
                 Effect::Edit { name, new } => self.edit(name, new, None),
                 Effect::Pick => self.pick(),
                 Effect::Notified => self.notified(self.last),
+                Effect::Help(topic) => self.help(&topic),
                 _ => {}
             }
         }
@@ -908,6 +1003,13 @@ impl App {
         self.refresh_normal();
         let bar = self.bar();
         let notes = self.notes();
+        if let Some(h) = &self.help {
+            let seg = |text: &str, kind| vec![Seg { text: text.into(), kind }];
+            let bar = Bar { left: seg(h.mode.label(), Kind::Mode), right: seg("help", Kind::Text) };
+            terminal.draw(|f| render::list(f, h, &[], &bar))?;
+            let modes = self.mouse_modes(Modes::default());
+            return self.set_outer(modes);
+        }
         if let Some(p) = &self.picker {
             // typing keeps what you were looking at; moving the selection previews it
             let shown = if p.browsing { p.selection() } else { self.viewing() };

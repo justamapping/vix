@@ -57,7 +57,7 @@ impl Default for Config {
 }
 
 /// Built-in view n mappings; a config mapping with the same lhs replaces one.
-fn default_view() -> Vec<Map> {
+pub fn default_view() -> Vec<Map> {
     vec![Map { lhs: vec![Key::Char('q')], rhs: vec![Key::Char('-')] }]
 }
 

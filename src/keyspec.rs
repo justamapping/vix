@@ -71,6 +71,37 @@ pub fn ctrl_byte(key: Key) -> Option<u8> {
     }
 }
 
+/// The ctrl key a terminal sends as byte `b`, the inverse of `ctrl_byte`.
+pub fn ctrl_key(b: u8) -> Option<Key> {
+    match b {
+        0 => Some(Key::Ctrl('@')),
+        1..=26 => Some(Key::Ctrl((b'a' + b - 1) as char)),
+        0x1c..=0x1f => Some(Key::Ctrl((b'\\' + b - 0x1c) as char)),
+        _ => None,
+    }
+}
+
+/// Keys in vim notation, the inverse of `parse`.
+pub fn notation(keys: &[Key]) -> String {
+    keys.iter()
+        .map(|&key| match key {
+            Key::Char('<') => "<lt>".into(),
+            Key::Char(' ') => "<Space>".into(),
+            Key::Char(c) => c.to_string(),
+            Key::Ctrl('@') => "<C-Space>".into(),
+            Key::Ctrl(c) => format!("<C-{c}>"),
+            Key::Enter => "<CR>".into(),
+            Key::Esc => "<Esc>".into(),
+            Key::Backspace => "<BS>".into(),
+            Key::Tab => "<Tab>".into(),
+            Key::Up => "<Up>".into(),
+            Key::Down => "<Down>".into(),
+            Key::Left => "<Left>".into(),
+            Key::Right => "<Right>".into(),
+        })
+        .collect()
+}
+
 /// What a terminal sends for `keys`, arrows in normal cursor mode.
 pub fn bytes(keys: &[Key]) -> Vec<u8> {
     let mut out = Vec::new();
@@ -105,6 +136,13 @@ mod tests {
     use Key::*;
 
     #[test]
+    fn notation_round_trips() {
+        for s in ["gg", "<C-d>", "<CR>", "<lt>a", "<Space>", "<Tab><Esc><BS>", "<C-\\>", "<C-Space>", "<Up>"] {
+            assert_eq!(notation(&parse(s).unwrap()), s);
+        }
+    }
+
+    #[test]
     fn plain_and_special() {
         assert_eq!(parse("gg").unwrap(), vec![Char('g'), Char('g')]);
         assert_eq!(parse(":q<CR>").unwrap(), vec![Char(':'), Char('q'), Enter]);
@@ -135,6 +173,9 @@ mod tests {
     #[test]
     fn escape_keys() {
         assert_eq!(escape("<C-\\>").unwrap(), 0x1c);
+        for b in [0, 1, 0x1c, 0x1d, 0x1e, 0x1f] {
+            assert_eq!(ctrl_key(b).and_then(ctrl_byte), Some(b));
+        }
         assert_eq!(escape("<C-Space>").unwrap(), 0);
         assert_eq!(escape("<C-a>").unwrap(), 1);
         assert_eq!(escape("<C-]>").unwrap(), 0x1d);

@@ -7,6 +7,7 @@ mod ctl;
 mod cwds;
 mod dump;
 mod follow;
+mod help;
 mod input;
 mod keymap;
 mod keyspec;
@@ -54,6 +55,7 @@ const USAGE: &str = "usage: vix [-r | --resume] [workflow]
        vix -d | --detached [-x cols] [-y rows] [-r | workflow]   starts it without attaching, prints its name
        vix -a | --attach [session]
        vix -l | --list
+       vix --keys                                                the keys, as your config has them (also :h)
        vix ctl <verb>, see vix ctl --help";
 
 fn main() -> Result<()> {
@@ -74,6 +76,14 @@ fn main() -> Result<()> {
             "-y" => rows = Some(args.next().and_then(|n| n.parse().ok()).context("-y takes a number of rows")?),
             // started by a client, not by hand
             "--server" => return server::run(&args.next().context("--server needs a session name")?),
+            "--keys" => {
+                let (config, error) = config::load();
+                if let Some(error) = error {
+                    eprintln!("{error}");
+                }
+                println!("{}", help::sheet(&config).join("\n"));
+                return Ok(());
+            }
             "-h" | "--help" => {
                 println!("{USAGE}");
                 return Ok(());

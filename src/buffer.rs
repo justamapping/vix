@@ -66,6 +66,8 @@ pub enum Effect {
     Edit { name: String, new: bool },
     /// the list's `:w name` writes, then saves the list as that workflow
     Save(String),
+    /// `:h [topic]` shows the keys, at the first line mentioning topic
+    Help(String),
 }
 
 #[derive(Debug, Clone)]
@@ -919,6 +921,7 @@ impl Buffer {
         }
         let (word, arg) = split(cmd);
         match (word, arg) {
+            ("h" | "help", _) => return vec![Effect::Help(arg.into())],
             ("d" | "delete", _) if self.readonly => return vec![Effect::Delete((!arg.is_empty()).then(|| arg.into()))],
             ("r" | "rename", "") if self.readonly => {
                 self.message = Some("E471: Argument required".into());
@@ -1158,6 +1161,7 @@ mod tests {
         assert_eq!(b.cursor.1, 0);
         assert_eq!(feed(&mut b, "\x1e"), vec![Effect::Alternate]);
         assert_eq!(feed(&mut b, "\t"), vec![Effect::Notified]);
+        assert_eq!(feed(&mut b, ":h tab\r"), vec![Effect::Help("tab".into())]);
         assert_eq!(feed(&mut b, "yy"), vec![Effect::Yank("$ ls\n".into())]);
         assert_eq!(feed(&mut b, ":x\r"), vec![Effect::Quit { force: false }]);
         assert_eq!(feed(&mut b, ":xd\r"), vec![Effect::Detach { force: false }]);
