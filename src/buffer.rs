@@ -928,12 +928,14 @@ impl Buffer {
                 return vec![];
             }
             ("r" | "rename", _) if self.readonly => return vec![Effect::Rename(arg.into())],
-            ("w" | "write", "") => {}
-            ("w" | "write", _) if self.readonly => {
+            ("w" | "write" | "wq" | "x" | "xd", "") => {}
+            ("w" | "write" | "wq" | "x" | "xd", _) if self.readonly => {
                 self.message = Some("E45: 'readonly' option is set".into());
                 return vec![];
             }
             ("w" | "write", _) => return vec![Effect::Save(arg.into())],
+            ("wq" | "x", _) => return vec![Effect::Save(arg.into()), Effect::Quit { force: false }],
+            ("xd", _) => return vec![Effect::Save(arg.into()), Effect::Detach { force: false }],
             _ => {}
         }
         match cmd {
@@ -1099,6 +1101,8 @@ mod tests {
         assert_eq!(feed(&mut b, ":qd\r"), vec![Effect::Detach { force: false }]);
         assert_eq!(feed(&mut b, ":detach!\r"), vec![Effect::Detach { force: true }]);
         assert_eq!(feed(&mut b, ":xd\r"), vec![Effect::Write, Effect::Detach { force: false }]);
+        assert_eq!(feed(&mut b, ":wq web\r"), vec![Effect::Save("web".into()), Effect::Quit { force: false }]);
+        assert_eq!(feed(&mut b, ":xd web\r"), vec![Effect::Save("web".into()), Effect::Detach { force: false }]);
         let edit = |name: &str, new| vec![Effect::Edit { name: name.into(), new }];
         assert_eq!(feed(&mut b, ":e web server\r"), edit("web server", false));
         assert_eq!(feed(&mut b, ":n api\r"), edit("api", true));
@@ -1165,6 +1169,8 @@ mod tests {
         assert_eq!(feed(&mut b, "yy"), vec![Effect::Yank("$ ls\n".into())]);
         assert_eq!(feed(&mut b, ":x\r"), vec![Effect::Quit { force: false }]);
         assert_eq!(feed(&mut b, ":xd\r"), vec![Effect::Detach { force: false }]);
+        assert_eq!(feed(&mut b, ":xd web\r"), vec![]);
+        assert!(b.message.as_deref().unwrap().starts_with("E45"));
     }
 
     /// View n over a row of output and a `$ ` prompt with `input` typed, the program's cursor at its end.

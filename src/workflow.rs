@@ -11,7 +11,37 @@ pub fn path(name: &str) -> Result<PathBuf> {
     if name.is_empty() || name.starts_with('.') || name.contains('/') {
         bail!("E32: bad workflow name {name:?}");
     }
-    Ok(config::dir().context("no $HOME")?.join("workflows").join(format!("{name}.toml")))
+    Ok(dir()?.join(format!("{name}.toml")))
+}
+
+fn dir() -> Result<PathBuf> {
+    Ok(config::dir().context("no $HOME")?.join("workflows"))
+}
+
+/// `vix -w`: the saved workflows' names, sorted.
+pub fn names() -> Result<Vec<String>> {
+    names_in(&dir()?)
+}
+
+fn names_in(dir: &Path) -> Result<Vec<String>> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", dir.display())),
+    };
+    let mut names: Vec<String> = entries
+        .filter_map(|e| e.ok()?.file_name().to_str()?.strip_suffix(".toml").map(String::from))
+        .collect();
+    names.sort();
+    Ok(names)
+}
+
+/// `vix --rm name`: deletes the file only, a session running it keeps running.
+pub fn remove(name: &str) -> Result<()> {
+    match std::fs::remove_file(path(name)?) {
+        Err(e) if e.kind() == ErrorKind::NotFound => bail!("no workflow {name}"),
+        result => result.with_context(|| format!("removing workflow {name}")),
+    }
 }
 
 /// A workflow that doesn't exist yet is `None`, like vim opening a new file.
@@ -94,6 +124,10 @@ mod tests {
         assert!(text.contains("cwd = \"~/proj\"\ncmd = \"npm run dev\""), "{text}");
         assert!(!text.contains("cmd = \"\""));
         assert_eq!(load_from(&path).unwrap(), Some(expected));
-        std::fs::remove_dir_all(dir).unwrap();
+        std::fs::write(dir.join("api.toml"), "").unwrap();
+        std::fs::write(dir.join("notes.txt"), "").unwrap();
+        assert_eq!(names_in(&dir).unwrap(), ["api", "web"]);
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(names_in(&dir).unwrap(), Vec::<String>::new());
     }
 }

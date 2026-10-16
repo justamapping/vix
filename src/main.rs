@@ -55,11 +55,13 @@ const USAGE: &str = "usage: vix [-r | --resume] [workflow]
        vix -d | --detached [-x cols] [-y rows] [-r | workflow]   starts it without attaching, prints its name
        vix -a | --attach [session]
        vix -l | --list
+       vix -w | --workflows                                      the saved workflows
+       vix --rm workflow                                         deletes one
        vix --keys                                                the keys, as your config has them (also :h)
        vix ctl <verb>, see vix ctl --help";
 
 fn main() -> Result<()> {
-    let (mut resume, mut attach, mut list, mut detached) = (false, false, false, false);
+    let (mut resume, mut attach, mut list, mut detached, mut workflows) = (false, false, false, false, false);
     let mut name: Option<String> = None;
     let (mut cols, mut rows): (Option<u16>, Option<u16>) = (None, None);
     let mut args = std::env::args().skip(1).peekable();
@@ -72,6 +74,8 @@ fn main() -> Result<()> {
             "-a" | "--attach" => attach = true,
             "-l" | "--list" => list = true,
             "-d" | "--detached" => detached = true,
+            "-w" | "--workflows" => workflows = true,
+            "--rm" => return workflow::remove(&args.next().context("--rm takes a workflow name")?),
             "-x" => cols = Some(args.next().and_then(|n| n.parse().ok()).context("-x takes a number of columns")?),
             "-y" => rows = Some(args.next().and_then(|n| n.parse().ok()).context("-y takes a number of rows")?),
             // started by a client, not by hand
@@ -92,11 +96,11 @@ fn main() -> Result<()> {
             _ => name = Some(arg),
         }
     }
-    if list {
-        if resume || attach || detached || name.is_some() {
-            bail!("--list takes nothing else\n{USAGE}");
+    if list || workflows {
+        if resume || attach || detached || name.is_some() || (list && workflows) {
+            bail!("--list and --workflows take nothing else\n{USAGE}");
         }
-        return list_sessions();
+        return if list { list_sessions() } else { list_workflows() };
     }
     if resume && (attach || name.is_some()) {
         bail!("--resume starts a new session, so it takes no name\n{USAGE}");
@@ -149,6 +153,27 @@ fn list_sessions() -> Result<()> {
     for (name, stream) in sessions {
         match sock::info(stream) {
             Ok(live) => println!("{live}"),
+            Err(e) => println!("{name}: {e:#}"),
+        }
+    }
+    Ok(())
+}
+
+/// `vix -w`: each saved workflow, and whether its session is running.
+fn list_workflows() -> Result<()> {
+    let names = workflow::names()?;
+    if names.is_empty() {
+        bail!("no workflows");
+    }
+    let running: Vec<String> = sock::sessions(&sock::dir()?)?.into_iter().map(|(name, _)| name).collect();
+    for name in names {
+        let state = if running.contains(&name) { " (running)" } else { "" };
+        match workflow::load(&name) {
+            Ok(session) => {
+                let terms = session.map_or(0, |s| s.terms.len());
+                let s = if terms == 1 { "" } else { "s" };
+                println!("{name}: {terms} terminal{s}{state}");
+            }
             Err(e) => println!("{name}: {e:#}"),
         }
     }

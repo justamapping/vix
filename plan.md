@@ -48,7 +48,8 @@ any      --:qa-->    quit vix    (:q only quits from the list)
   terminal when it overflows. Fields `{mode} {name} {index} {total} {modified} {workflow} {terms}`.
 - **resume**: `vix -r` restores names, live cwd (pid -> cwd like tmux), and scrollback (`dump`), not programs.
 - **workflows**: `:w name` saves the list to `~/.config/vix/workflows/name.toml`, after which `:w` keeps saving
-  there. `vix name` opens one (or a new one, like `vim newfile`). Per terminal: `name`, `cwd` (`~` ok), `cmd`.
+  there; `:wq name` / `:xd name` save then quit / detach. `vix name` opens one (or a new one, like
+  `vim newfile`), `vix -w` lists them, `vix --rm name` deletes one. Per terminal: `name`, `cwd` (`~` ok), `cmd`.
 - **prompt editing**: operators in view n edit the program's input (shells, REPLs, claude code), see below.
 - **text objects**: `iw aw iW aW ip ap`, quotes `" ' \``, brackets `( [ { <` (and `b` `B`) with counts, after
   operators and in visual; `r`, `~`. Quotes pair up from the line's start (vim guesses from the cursor), brackets

@@ -81,6 +81,7 @@ const GROUPS: &[Group] = &[
             (Ex(&[":q"]), "view n: up to the list. the list: quit, killing the session"),
             (Ex(&[":q!"]), "view n: kill the terminal"),
             (Ex(&[":qd"]), "detach, the session keeps running (vix -a)"),
+            (Ex(&[":wq name", ":xd name"]), "the list: save as a workflow, then quit / detach"),
             (Ex(&[":qa"]), "quit and kill the session"),
         ],
     },

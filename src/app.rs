@@ -893,6 +893,11 @@ impl App {
                     }
                 }
                 Effect::Save(name) => {
+                    // a bad name would otherwise quit without saving
+                    if let Err(e) = workflow::path(&name) {
+                        self.list.message = Some(e.to_string());
+                        return Ok(());
+                    }
                     self.write(None);
                     self.remote.send(&Request::Save { workflow: Some(name), cursor: self.cursor() });
                 }
