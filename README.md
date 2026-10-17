@@ -9,6 +9,12 @@ when inside vix.
 
 ## Installation
 
+### Prebuilt binary (macOS, Linux)
+
+```sh
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/justamapping/vix/releases/latest/download/vix-installer.sh | sh
+```
+
 ### Using Cargo
 
 To install vix, clone this repository, and type `cargo install --path . --locked`, then type `vix`, and you're in!
