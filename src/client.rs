@@ -136,7 +136,7 @@ impl Remote {
     pub fn resized(&mut self, cols: u16, rows: u16) {
         (self.cols, self.rows) = (cols, rows);
         for t in &mut self.terms {
-            t.vt.screen_mut().set_size(rows, cols);
+            vt::resize(&mut t.vt, cols, rows);
         }
     }
 }

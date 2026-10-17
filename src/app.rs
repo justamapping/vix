@@ -77,6 +77,8 @@ pub struct App {
     /// when a partly typed mapping gives up waiting
     pub deadline: Option<Instant>,
     pub quit: bool,
+    /// the outer terminal resized, so its screen can't be trusted to match the last frame
+    repaint: bool,
     /// printed once the screen is restored, like `[detached from 0]`
     pub farewell: Option<String>,
 }
@@ -142,6 +144,7 @@ impl App {
             config,
             deadline: None,
             quit: false,
+            repaint: false,
             farewell: None,
         };
         app.size_buffers();
@@ -315,9 +318,10 @@ impl App {
                 Ok(false)
             }
             Event::Resize => {
-                crate::log::log("resize");
                 let (cols, rows) = crossterm::terminal::size()?;
+                crate::log::log(format_args!("resize {cols}x{rows}"));
                 (self.cols, self.rows) = (cols, rows);
+                self.repaint = true;
                 self.size_buffers();
                 self.remote.send(&Request::Resize { cols, rows: self.term_rows() });
                 Ok(true)
@@ -380,6 +384,7 @@ impl App {
                 true
             }
             Reply::Resized { cols, rows } => {
+                crate::log::log(format_args!("resized {cols}x{rows}"));
                 self.remote.resized(cols, rows);
                 if let View::Normal(id) = self.view {
                     self.enter_normal(id);
@@ -1002,6 +1007,11 @@ impl App {
     }
 
     pub fn draw(&mut self, terminal: &mut DefaultTerminal) -> Result<()> {
+        // not `clear`, which asks the terminal where its cursor is, and stdin is read elsewhere
+        if std::mem::take(&mut self.repaint) {
+            let area = terminal.size()?.into();
+            terminal.resize(area)?;
+        }
         if self.viewing().is_some_and(|id| !self.alive(id)) {
             self.view = View::List;
         }

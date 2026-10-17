@@ -2,12 +2,16 @@
 
 ![Vix demo](./assets/vixdemo.gif)
 
-Vix is the fast, vim-inspired terminal multiplexer you never knew you needed. Based on vim keybinds,
-you can enter a new terminal session by typing the command `vix`. It will take you to a list
-of your terminals that you can name by using a vim-like editor, then go into by hitting Enter.
+Vix is the fast, vim-inspired visual terminal multiplexer you never knew you needed.
 
 To understand how to maneuver using vix, type `vix --keys` in the terminal, or type :h in command mode
 when inside vix.
+
+## Installation
+
+### Using Cargo
+
+To install vix, clone this repository, and type `cargo install --path . --locked`, then type `vix`, and you're in!
 
 ## States
 
@@ -28,3 +32,6 @@ terminal without any interference until you hit your escape sequence to get back
 
 You can configure vix inside of `~/.config/vix/config.toml`
 An example config to get started is inside of [Examples](./examples/config/config.toml)
+
+## How to exit vix
+`:q!<Enter>` or, you can ask your agent to help you quit vix via ctl.

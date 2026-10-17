@@ -60,6 +60,20 @@ pub fn parser(cols: u16, rows: u16) -> Parser {
     vt100::Parser::new_with_callbacks(rows, cols, SCROLLBACK, Callbacks::default())
 }
 
+/// Resizes like xterm and tmux: shrinking the main screen past the cursor scrolls its top lines into scrollback,
+/// where vt100 alone would drop the bottom ones and move the cursor up under the program.
+pub fn resize(parser: &mut Parser, cols: u16, rows: u16) {
+    let screen = parser.screen();
+    let (old_rows, _) = screen.size();
+    let (row, col) = screen.cursor_position();
+    if !screen.alternate_screen() && row >= rows {
+        let n = row + 1 - rows;
+        let scroll = format!("\x1b[{old_rows};1H{}\x1b[{};{}H", "\n".repeat(n.into()), row + 1 - n, col + 1);
+        parser.process(scroll.as_bytes());
+    }
+    parser.screen_mut().set_size(rows, cols);
+}
+
 /// Rows of scrollback above the screen.
 pub fn history(screen: &mut Screen) -> usize {
     screen.set_scrollback(usize::MAX);
@@ -168,6 +182,29 @@ mod tests {
         assert_eq!(history(s), 4);
         assert_eq!(text(s), ["1", "2", "3", "4", "5", "6", "7"]);
         assert_eq!(s.scrollback(), 0);
+    }
+
+    #[test]
+    fn shrinking_past_the_cursor_scrolls_into_scrollback() {
+        let mut p = vt100::Parser::new_with_callbacks(4, 10, SCROLLBACK, Callbacks::default());
+        p.process(b"1\r\n2\r\n3\r\n$ x");
+        resize(&mut p, 10, 3);
+        assert_eq!(p.screen().cursor_position(), (2, 3));
+        assert_eq!(text(p.screen_mut()), ["1", "2", "3", "$ x"]);
+        // growing, and shrinking what's below the cursor, leave it in place
+        resize(&mut p, 10, 5);
+        resize(&mut p, 10, 3);
+        assert_eq!(p.screen().cursor_position(), (2, 3));
+        assert_eq!(text(p.screen_mut()), ["1", "2", "3", "$ x"]);
+    }
+
+    #[test]
+    fn shrinking_the_alternate_screen_just_truncates() {
+        let mut p = vt100::Parser::new_with_callbacks(4, 10, SCROLLBACK, Callbacks::default());
+        p.process(b"\x1b[?1049h1\r\n2\r\n3\r\n4");
+        resize(&mut p, 10, 3);
+        assert_eq!(p.screen().cursor_position(), (2, 1));
+        assert_eq!(history(p.screen_mut()), 0);
     }
 
     #[test]

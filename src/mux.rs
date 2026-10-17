@@ -223,7 +223,7 @@ impl<E: From<PtyEvent> + Send + 'static> Mux<E> {
         (self.cols, self.rows) = (cols, rows);
         for t in &mut self.terms {
             t.pty.resize(cols, rows)?;
-            t.vt.screen_mut().set_size(rows, cols);
+            vt::resize(&mut t.vt, cols, rows);
             t.quiet = t.quiet.max(Instant::now() + RESIZE_QUIET);
         }
         Ok(())

@@ -37,7 +37,7 @@ use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use ratatui::DefaultTerminal;
@@ -50,6 +50,8 @@ use session::Session;
 
 // events handled before a redraw, so a flooding program can't starve the screen
 const BATCH: usize = 256;
+// how long after a resize the outer terminal is redrawn again, once it's settled
+const RESETTLE: Duration = Duration::from_millis(100);
 
 const USAGE: &str = "usage: vix [-r | --resume] [workflow]
        vix -d | --detached [-x cols] [-y rows] [-r | workflow]   starts it without attaching, prints its name
@@ -123,7 +125,17 @@ fn main() -> Result<()> {
     let sig = tx.clone();
     thread::spawn(move || {
         for signal in signals.forever() {
-            let _ = sig.send(if signal == SIGWINCH { Event::Resize } else { Event::Hangup });
+            if signal != SIGWINCH {
+                let _ = sig.send(Event::Hangup);
+                continue;
+            }
+            let _ = sig.send(Event::Resize);
+            // iTerm2 moves its screen after saying it resized, like when its tab bar appears, so draw it all again
+            let late = sig.clone();
+            thread::spawn(move || {
+                thread::sleep(RESETTLE);
+                let _ = late.send(Event::Resize);
+            });
         }
     });
 
