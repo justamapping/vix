@@ -1,10 +1,11 @@
 [package]
 name = "vix"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "A fast, vim-inspired visual terminal multiplexer"
 license = "MIT"
 repository = "https://github.com/justamapping/vix"
+homepage = "https://github.com/justamapping/vix"
 readme = "README.md"
 keywords = ["terminal", "multiplexer", "vim", "tui"]
 categories = ["command-line-utilities"]
