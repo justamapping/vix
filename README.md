@@ -1,6 +1,6 @@
 # Vix
 
-gif of vix demo here
+![Vix demo](./assets/vixdemo.gif)
 
 Vix is the fast, vim-inspired terminal multiplexer you never knew you needed. Based on vim keybinds,
 you can enter a new terminal session by typing the command `vix`. It will take you to a list
