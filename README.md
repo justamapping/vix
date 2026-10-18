@@ -9,6 +9,13 @@ when inside vix.
 
 ## Installation
 
+### Homebrew (macOS, Linuxbrew)
+
+```sh
+brew tap justamapping/tap
+brew install vix
+```
+
 ### Prebuilt binary (macOS, Linux)
 
 ```sh
